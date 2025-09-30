@@ -45,8 +45,8 @@ pip install -r requirements.txt
 ```
 
 ## ⚙️ Git 기본 규칙
-* 기능 추가/수정은 반드시 **포크(origin)** 저장소에서 브랜치를 생성 후,
-* Pull Request(PR)로 원본(upstream) `dev` 브랜치에 병합합니다.
+* 기능 추가/수정은 반드시 **포크 (origin)** 저장소에서 브랜치를 생성 후,
+* Pull Request (PR)로 원본 (upstream) `dev` 브랜치에 병합합니다.
 * 코드 리뷰와 테스트 통과 후에만 `upstream/dev`에 반영됩니다.
 
 ### 1. 최초 세팅 시
