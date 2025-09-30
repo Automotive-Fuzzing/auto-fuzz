@@ -19,3 +19,6 @@ env/
 
 # Unit test / coverage cache
 .pytest_cache/
+
+# Logs
+*.log
