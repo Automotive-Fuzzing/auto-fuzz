@@ -36,7 +36,7 @@ source .venv/bin/activate
 
 ### 4. pip 최신화
 ```bash
-pip install --upgrade pip
+python -m pip install --upgrade pip
 ```
 
 ### 5. 필수 라이브러리 설치
