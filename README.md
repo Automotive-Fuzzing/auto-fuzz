@@ -49,18 +49,35 @@ pip install -r requirements.txt
 * Pull Request(PR)로 원본(upstream) `dev` 브랜치에 병합합니다.
 * 코드 리뷰와 테스트 통과 후에만 `upstream/dev`에 반영됩니다.
 
-### 1. 기능 개발 시작: 브랜치 생성 및 이동
-#### 1️⃣ dev 최신화 (upstream 기준)
+### 1. 최초 세팅 시
+#### 1️⃣ upstream 등록
+```bash
+git remote add upstream https://github.com/Automotive-Fuzzing/auto-fuzz.git
+```
+
+#### 2️⃣ 확인
+* `origin` (내 포크) + `upstream` (원본) 둘 다 보여야 정상
+```bash
+git remote -v
+```
+
+#### 3️⃣ 원본 최신 dev 가져오기
 ```bash
 git fetch upstream
-git checkout dev
-git merge upstream/dev 
-git push origin dev --force-with-lease
 ```
-#### 2️⃣ feature 브랜치 생성
+#### 4️⃣ 내 dev를 원본과 동일하게 맞추기
+* reset, 기록 덮어쓰는 과정
+```bash
+git checkout dev
+git reset --hard upstream/dev
+git push origin dev --force
+```
+
+### 2. 브랜치 생성 및 이동
 ```bash
 git switch -c feature/기능명
 ```
+
 #### 🌿 브랜치명 규칙
 * feature/기능명 (새 기능)
 * bugfix/이슈번호-설명 (버그 수정)
