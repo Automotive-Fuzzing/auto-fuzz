@@ -45,54 +45,60 @@ pip install -r requirements.txt
 ```
 
 ## ⚙️ Git 기본 규칙
-* 기능 추가/수정은 반드시 **포크(origin)** 저장소에서 브랜치를 생성 후,
-* Pull Request(PR)로 원본(upstream) `dev` 브랜치에 병합합니다.
+* 기능 추가/수정은 반드시 **포크 (origin)** 저장소에서 브랜치를 생성 후,
+* Pull Request (PR)로 원본 (upstream) `dev` 브랜치에 병합합니다.
 * 코드 리뷰와 테스트 통과 후에만 `upstream/dev`에 반영됩니다.
 
-### 1. 기능 개발 시작: 브랜치 생성 및 이동
-#### 1️⃣ dev 최신화 (upstream 기준)
+### 1. 최초 세팅 시
+#### 1️⃣ upstream 등록
+```bash
+git remote add upstream https://github.com/Automotive-Fuzzing/auto-fuzz.git
+```
+
+#### 2️⃣ 확인
+* `origin` (내 포크) + `upstream` (원본) 둘 다 보여야 정상
+```bash
+git remote -v
+```
+
+#### 3️⃣ 원본 최신 dev 가져오기
 ```bash
 git fetch upstream
-git checkout dev
-git merge upstream/dev 
-git push origin dev --force-with-lease
 ```
-#### 2️⃣ feature 브랜치 생성
+#### 4️⃣ 내 dev를 원본과 동일하게 맞추기
+* reset, 기록 덮어쓰는 과정
+```bash
+git checkout dev
+git reset --hard upstream/dev
+git push origin dev --force
+```
+
+### 2. 브랜치 생성 및 이동
 ```bash
 git switch -c feature/기능명
 ```
+
 #### 🌿 브랜치명 규칙
 * feature/기능명 (새 기능)
 * bugfix/이슈번호-설명 (버그 수정)
-* docs/문서명 (문서)
-* test/설명 (테스트)
+@@ -86,7 +69,7 @@
 
 **Ex.** `feature/github-api-integration`, `bugfix/34-filter-extension-error`, `docs/update-readme`
 
-### 2. 코드 수정 → 변경사항 저장 (commit)
+### 3. 코드 수정 → 변경사항 저장 (commit)
 ```bash
 git add "경로/파일이름.py"
 git commit -m "Add: GitHub API 연동 기능 추가"
-```
-**Ex.** `Add: 퍼저 실행 기능 구현`, `Fix: DBC 파싱 시 버그 수정`, `Docs: README 업데이트`
-
-#### 📝 커밋 메시지 규칙
-* 타입 접두사 사용:
-  * `Add` (새 기능)
-  * `Fix` (버그 수정)
-  * `Update` (기존 코드/문서/설정 변경)
-  * `Remove` (삭제)
-  * `Refactor` (구조 개선)
-  * `Docs` (문서)
+@@ -104,47 +87,47 @@
   * `Test` (테스트)
   * `Chore` (환경/설정)
 
-### 3. GitHub에 업로드 (push)
+### 4. GitHub에 업로드 (push)
 ```bash
 git push origin feature/기능명
 ```
 
-### 4. Pull Request(PR) 생성
+### 5. Pull Request(PR) 생성
 > GitHub에서 **Compare & pull request** 버튼 클릭
 
 #### 📌 PR 설정 및 Comment 작성
@@ -100,7 +106,7 @@ git push origin feature/기능명
 * compare: `origin/feature/기능명`
 * 제목/설명 작성 → **Create pull request**
 
-### 5. upstream/dev 최신 반영하기 (내 브랜치 갱신)
+### 6. upstream/dev 최신 반영하기 (내 브랜치 갱신)
 > 작업 중간이나 PR 직전에 최신 dev를 반영하세요.
 
 ```bash
