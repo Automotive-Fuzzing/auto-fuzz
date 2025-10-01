@@ -86,7 +86,7 @@ git switch -c feature/기능명
 
 **Ex.** `feature/github-api-integration`, `bugfix/34-filter-extension-error`, `docs/update-readme`
 
-### 2. 코드 수정 → 변경사항 저장 (commit)
+### 3. 코드 수정 → 변경사항 저장 (commit)
 ```bash
 git add "경로/파일이름.py"
 git commit -m "Add: GitHub API 연동 기능 추가"
@@ -104,12 +104,12 @@ git commit -m "Add: GitHub API 연동 기능 추가"
   * `Test` (테스트)
   * `Chore` (환경/설정)
 
-### 3. GitHub에 업로드 (push)
+### 4. GitHub에 업로드 (push)
 ```bash
 git push origin feature/기능명
 ```
 
-### 4. Pull Request(PR) 생성
+### 5. Pull Request(PR) 생성
 > GitHub에서 **Compare & pull request** 버튼 클릭
 
 #### 📌 PR 설정 및 Comment 작성
@@ -117,7 +117,7 @@ git push origin feature/기능명
 * compare: `origin/feature/기능명`
 * 제목/설명 작성 → **Create pull request**
 
-### 5. upstream/dev 최신 반영하기 (내 브랜치 갱신)
+### 6. upstream/dev 최신 반영하기 (내 브랜치 갱신)
 > 작업 중간이나 PR 직전에 최신 dev를 반영하세요.
 
 ```bash
