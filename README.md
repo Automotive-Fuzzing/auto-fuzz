@@ -89,7 +89,7 @@ git switch -c feature/기능명
 ```bash
 git add "경로/파일이름.py"
 git commit -m "Add: GitHub API 연동 기능 추가"
-@@ -104,47 +87,47 @@
+```
   * `Test` (테스트)
   * `Chore` (환경/설정)
 
