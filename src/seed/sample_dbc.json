@@ -1,0 +1,6 @@
+{
+  "0x101": {
+    "name": "Engine",
+    "signals": ["Speed", "RPM"]
+  }
+}
