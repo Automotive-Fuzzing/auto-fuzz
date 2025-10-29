@@ -2,6 +2,7 @@ import can
 import isotp
 import time
 
+
 class UDSMonitor:
     def __init__(self,
                  channel: str = "can0",
@@ -16,6 +17,21 @@ class UDSMonitor:
         self.channel = channel
         self.ecu_tx_id = ecu_tx_id
         self.ecu_rx_id = ecu_rx_id
+
+        # NRC 코드 매핑 (리뷰 반영)
+        self.NRC_TABLE = {
+            0x10: "General Reject",
+            0x11: "Service Not Supported",
+            0x12: "Sub-function Not Supported",
+            0x13: "Incorrect Message Length",
+            0x22: "Conditions Not Correct",
+            0x31: "Request Out Of Range",
+            0x33: "Security Access Denied",
+            0x78: "Response Pending",
+            0x73: "Wrong Block Sequence Counter",
+            # 필요하면 여기에 추가
+        }
+        self.DEFAULT_NRC_DESC = "Unknown NRC"
 
         # CAN 버스 초기화
         try:
@@ -75,27 +91,11 @@ class UDSMonitor:
         elif len(response) >= 2 and response[0] == 0x50 and response[1] == 0x03:
             print("✅ ECU 진단 세션 진입 성공!")
         elif len(response) >= 3 and response[0] == 0x7F:
-            nrc = response[2]
-            print(f"⚠️ Negative Response (NRC: 0x{nrc:02X})")
+            # Negative Response 처리: NRC 값 매핑
+            nrc = int(response[2])
+            desc = self.NRC_TABLE.get(nrc, self.DEFAULT_NRC_DESC)
+            print(f"⚠️ Negative Response (NRC: 0x{nrc:02X}) - {desc}")
         else:
             print("⚠️ 알 수 없는 응답:", response.hex())
 
         print("[INFO] 🚗 UDS 세션 진입 시퀀스 종료.")
-
-
-# ------------------------------
-# 실행 예시
-# ------------------------------
-if __name__ == "__main__":
-    monitor = UDSMonitor(channel="can0")
-
-    # ECU ID를 나중에 알게 되면 이렇게 실행
-    # monitor.start(ecu_tx_id=0x366, ecu_rx_id=0x766)
-
-    # 지금은 테스트 상태로 실행
-    monitor.start()
-    
-    def fetch_event(self):
-        
-
-
