@@ -1,200 +1,194 @@
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional, Callable
-import time
+from typing import Optional, Dict, Tuple
+import time, os
+import can
+import isotp
+import yaml
+
+CAN_CHANNEL         = "can0"
+TARGET_UDS_ID       = 0x366
+UDS_RESPONSE_OFFSET = 0x6A                 # 응답 ID = TARGET_UDS_ID + 0x6A
+PADDING_BYTE        = 0xAA                 # ISO-TP TX 패딩 바이트
+
+_ISOTP_PARAMS = {
+    "stmin": 0,
+    "blocksize": 8,
+    "wftmax": 0,
+    "tx_data_length": 8,
+    "tx_padding": PADDING_BYTE,
+    "rx_flowcontrol_timeout": 1000,
+    "rx_consecutive_frame_timeout": 1000,
+}
+
+def load_nrc_config_strict(path: str) -> Tuple[Dict[int, float], Dict[str, float]]:
+    """
+    엄격 모드:
+      - 파일/필드/형식이 틀리면 즉시 예외
+      - nrc_scores: 키는 반드시 '0x..' 16진 문자열 → int로 변환
+      - context_multipliers: 키는 반드시 '0x..' 소문자 16진 문자열
+    """
+    if not path or not os.path.exists(path):
+        raise FileNotFoundError(f"UDSMonitor config not found: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+
+    if not isinstance(data, dict):
+        raise ValueError("Config YAML root must be a mapping")
+
+    if "nrc_scores" not in data or "context_multipliers" not in data:
+        raise KeyError("Config must contain both 'nrc_scores' and 'context_multipliers'")
+
+    raw_scores = data["nrc_scores"]
+    raw_ctx    = data["context_multipliers"]
+
+    if not isinstance(raw_scores, dict) or not isinstance(raw_ctx, dict):
+        raise ValueError("'nrc_scores' and 'context_multipliers' must be mappings")
+
+    # nrc_scores: '0x..' 문자열 → int 키
+    nrc_scores: Dict[int, float] = {}
+    for k, v in raw_scores.items():
+        if not isinstance(k, str) or not k.strip().lower().startswith("0x"):
+            raise ValueError(f"NRC key must be hex string like '0x10', got {k!r}")
+        try:
+            ki = int(k.strip().lower(), 16)
+            vf = float(v)
+        except Exception as e:
+            raise ValueError(f"Invalid nrc_scores entry {k!r}:{v!r} → {e}")
+        nrc_scores[ki] = vf
+
+    # context_multipliers: '0x..' 소문자 16진 문자열
+    ctx_mul: Dict[str, float] = {}
+    for k, v in raw_ctx.items():
+        if not isinstance(k, str):
+            raise ValueError(f"Context key must be string like '0x10', got {type(k)}")
+        ks = k.strip().lower()
+        if not ks.startswith("0x"):
+            raise ValueError(f"Context key must start with '0x': {k!r}")
+        try:
+            int(ks, 16)  # 유효성 확인
+            vf = float(v)
+        except Exception as e:
+            raise ValueError(f"Invalid context_multipliers entry {k!r}:{v!r} → {e}")
+        ctx_mul[ks] = vf
+
+    if not nrc_scores:
+        raise ValueError("'nrc_scores' must not be empty")
+    if not ctx_mul:
+        raise ValueError("'context_multipliers' must not be empty")
+
+    return nrc_scores, ctx_mul
+
 
 @dataclass
 class UDSEvent:
-    service: str               
-    response_type: str           
-    code: Optional[int]
-    raw: bytes
-    timestamp: float
-
-class ISOTPAssembler:
-    def __init__(self):
-        self.buffer = bytearray()
-        self.expected_len = 0
-        self.next_sn = 1
-        self.in_progress = False
-
-    def feed(self, data: bytes) -> Optional[bytes]:
-        if not data:
-            return None
-
-        pci_type = (data[0] & 0xF0) >> 4
-        pci_low  =  data[0] & 0x0F
-
-        # SF: Single Frame (<=7 data bytes)
-        if pci_type == 0x0:
-            length = pci_low
-            return data[1:1 + length]
-
-        # FF: First Frame
-        elif pci_type == 0x1:
-            self.expected_len = ((pci_low << 8) | data[1])
-            self.buffer = bytearray(data[2:])
-            self.in_progress = True
-            self.next_sn = 1
-            return None  # wait for CFs
-
-        # CF: Consecutive Frame
-        elif pci_type == 0x2 and self.in_progress:
-            sn = pci_low
-            # sequence check
-            if sn != (self.next_sn & 0x0F):
-                self.reset()
-                return None
-            self.next_sn += 1
-            self.buffer.extend(data[1:])
-            if len(self.buffer) >= self.expected_len:
-                pdu = bytes(self.buffer[:self.expected_len])
-                self.reset()
-                return pdu
-            return None
-
-        # FC: Flow Control (0x3) → ignore (receiver side)
-        else:
-            return None
-
-    def reset(self):
-        self.buffer = bytearray()
-        self.expected_len = 0
-        self.next_sn = 1
-        self.in_progress = False
+    service: str                 # "0x10", "0x3E", ...
+    response_type: str           # "positive" | "negative"
+    code: Optional[int]          # NRC (긍정은 None)
+    raw: bytes                   # 수신 UDS PDU
+    timestamp: float             # 수신 시각
+    score: float = 0.0           # 부정응답 위험 점수
 
 
 class UDSMonitor:
     """
-    - send_0x10 / send_0x3e: 단일프레임 송신 + 응답 대기/분류
-    - probe_session_then_tester_present: 0x10 긍정이면 0x3E 연속 수행
+    - 디폴트 제거: YAML 설정 필수
+    - __init__() : 버스/스택 준비 + 설정 로드
+    - start()    : 0x10 → 응답 처리 → positive면 0x3E까지
     """
-    def __init__(
-        self,
-        tx_id: int = 0x7E0,
-        rx_id: int = 0x7E8,
-        sender: Optional[Callable[[int, bytes], None]] = None,
-        collector: Optional[Callable[[float], List[Tuple[int, bytes, float]]]] = None,
-    ):
-        self.tx_id = tx_id
-        self.rx_id = rx_id
-        self.sender = sender          
-        self.collector = collector    
-        self.assembler = ISOTPAssembler()
 
-    # -------------------------
-    # Parse UDS response (positive/negative만 생성)
-    # -------------------------
-    @staticmethod
-    def parse_uds_pdu(pdu: bytes) -> Optional["UDSEvent"]:
-        # Negative Response (0x7F <req_service> <NRC>)
-        if len(pdu) >= 3 and pdu[0] == 0x7F:
-            req_srv, nrc = pdu[1], pdu[2]
-            return UDSEvent(f"0x{req_srv:02X}", "negative", nrc, pdu, time.time())
+    def __init__(self,
+                 bus: Optional[can.Bus] = None,
+                 tx_id: int = TARGET_UDS_ID,
+                 rx_id: int = TARGET_UDS_ID + UDS_RESPONSE_OFFSET,
+                 nrc_cfg_path: str = "config/nrc_weights.yaml"):
 
-        # Positive Response (0x40 + <req_service>)
-        if len(pdu) >= 1 and pdu[0] >= 0x40:
-            service = pdu[0] - 0x40
-            return UDSEvent(f"0x{service:02X}", "positive", None, pdu, time.time())
+        self.bus = bus or can.interface.Bus(bustype="socketcan", channel=CAN_CHANNEL)
+        self.addr = isotp.Address(isotp.AddressingMode.Normal_11bits, txid=tx_id, rxid=rx_id)
+        self.stack = isotp.CanStack(bus=self.bus, address=self.addr, params=_ISOTP_PARAMS)
 
-        # 그 외는 이벤트 생성 안 함
-        return None
+        # 설정 필수 로드
+        self._nrc_score, self._ctx_mul = load_nrc_config_strict(nrc_cfg_path)
 
-    @staticmethod
-    def _build_sf_from_uds_pdu(uds_pdu: bytes) -> bytes:
-        """
-        UDS PDU (<=7 bytes)를 ISO-TP Single Frame로 캡슐화해 8바이트 반환.
-        """
-        if len(uds_pdu) > 7:
-            raise ValueError("PDU too long for Single Frame")
-        pad_len = 7 - len(uds_pdu)
-        return bytes([len(uds_pdu)]) + uds_pdu + bytes(pad_len)
+    def start(self,
+              session_sub: int = 0x01,
+              tester_sub: int = 0x00,
+              t1: float = 1.0,
+              t2: float = 1.0) -> Dict[str, Optional[UDSEvent]]:
 
-    def _wait_one_uds_event(
-        self,
-        expected_service: int,
-        timeout: float = 1.0,
-        poll_interval: float = 0.02,
-    ) -> Optional[UDSEvent]:
-        """
-        collector를 폴링하여 응답 하나를 조립 완료될 때까지 기다리고 반환.
-        expected_service와 매칭되는 positive/negative만 리턴.
-        """
-        if not self.collector:
-            return None
-
-        t0 = time.time()
-        last_ts = t0
-        while time.time() - t0 < timeout:
-            frames = self.collector(last_ts)  
-            if frames:
-                last_ts = max(last_ts, max(ts for _, _, ts in frames))
-            for arbid, data, ts in frames:
-                if arbid != self.rx_id:
-                    continue
-                pdu = self.assembler.feed(data)
-                if pdu is None:
-                    continue
-                evt = self.parse_uds_pdu(pdu)
-                if evt is not None:
-                    evt.timestamp = ts
-                    # positive: 0x40+expected_service
-                    # negative: 0x7F,<expected_service>,<NRC>
-                    if evt.service.lower() == f"0x{expected_service:02x}":
-                        return evt
-            time.sleep(poll_interval)
-
-        return None  # timeout
-
-    # -------------------------
-    # Send 0x10 & wait response
-    # -------------------------
-    def send_0x10(self, subfunc: int = 0x01, timeout: float = 1.0) -> Optional[UDSEvent]:
-        if not self.sender:
-            raise RuntimeError("sender is not set")
-        uds_pdu = bytes([0x10, subfunc])
-        can_data = self._build_sf_from_uds_pdu(uds_pdu)
-        self.sender(self.tx_id, can_data)
-        return self._wait_one_uds_event(expected_service=0x10, timeout=timeout)
-
-    # -------------------------
-    # Send 0x3E & wait response
-    # -------------------------
-    def send_0x3e(self, subfunc: int = 0x00, timeout: float = 1.0) -> Optional[UDSEvent]:
-        if not self.sender:
-            raise RuntimeError("sender is not set")
-        uds_pdu = bytes([0x3E, subfunc])
-        can_data = self._build_sf_from_uds_pdu(uds_pdu)
-        self.sender(self.tx_id, can_data)
-        return self._wait_one_uds_event(expected_service=0x3E, timeout=timeout)
-
-    # -------------------------
-    # Sequence: 0x10 → (positive) 0x3E
-    # -------------------------
-    def probe_session_then_tester_present(
-        self,
-        session_sub: int = 0x01,
-        tester_sub: int = 0x00,
-        t1: float = 1.0,
-        t2: float = 1.0,
-    ) -> Dict[str, Optional[UDSEvent]]:
-        """
-        1) 0x10 세션 전환 요청 → 응답 분류
-        2) positive면 0x3E tester present → 응답 분류
-        """
         result: Dict[str, Optional[UDSEvent]] = {"0x10": None, "0x3E": None}
-        evt10 = self.send_0x10(session_sub, timeout=t1)
+
+        # Step 1: 0x10
+        self._send_uds(bytes([0x10, session_sub]))
+        evt10 = self._recv_one(expected_sid=0x10, timeout=t1)
         result["0x10"] = evt10
 
+        # Step 2: 0x3E (only if positive 0x10)
         if evt10 and evt10.response_type == "positive":
-            evt3e = self.send_0x3e(tester_sub, timeout=t2)
+            self._send_uds(bytes([0x3E, tester_sub]))
+            evt3e = self._recv_one(expected_sid=0x3E, timeout=t2)
             result["0x3E"] = evt3e
 
         return result
 
-    # -------------------------
-    # Simple print helper (optional)
-    # -------------------------
-    def interpret(self, events: List[UDSEvent]) -> None:
-        print("UDS Monitor Events:")
-        for e in events:
-            print(f"  [{e.timestamp:.3f}] {e.service:<6} {e.response_type:<9} {e.code or '-'} {e.raw.hex().upper()}")
+    def _send_uds(self, uds_pdu: bytes) -> None:
+        self.stack.send(uds_pdu)
+        while self.stack.transmitting():
+            self.stack.process()
+            time.sleep(0.002)
+
+    def _recv_one(self, expected_sid: int, timeout: float) -> Optional[UDSEvent]:
+        """
+        기대 서비스(예: 0x10/0x3E)의 응답 1건 동기 수신.
+        - 0x7F: 설정된 NRC만 스코어링(미정의 NRC는 continue)
+        - positive: 그대로 반환
+        - timeout: None
+        """
+        deadline = time.time() + timeout
+        expected_tag = f"0x{expected_sid:02X}".lower()
+
+        while time.time() < deadline:
+            self.stack.process()
+            if self.stack.available():
+                pdu = self.stack.recv()
+                ts = time.time()
+
+                evt = self._parse_uds_pdu(pdu, ts)
+                if not evt:
+                    continue
+                if evt.service.lower() != expected_tag:
+                    continue
+                if evt.response_type == "negative":
+                    if not self._score(evt):   # 미정의 NRC면 continue
+                        continue
+                return evt
+
+            time.sleep(self.stack.sleep_time())
+
+        return None
+
+    @staticmethod
+    def _parse_uds_pdu(pdu: bytes, ts: float) -> Optional[UDSEvent]:
+        if not pdu:
+            return None
+        # Negative: 0x7F <req_sid> <nrc>
+        if len(pdu) >= 3 and pdu[0] == 0x7F:
+            return UDSEvent(service=f"0x{pdu[1]:02X}", response_type="negative",
+                            code=pdu[2], raw=pdu, timestamp=ts)
+        # Positive: 0x40 + <req_sid>
+        if pdu[0] >= 0x40:
+            sid = pdu[0] - 0x40
+            return UDSEvent(service=f"0x{sid:02X}", response_type="positive",
+                            code=None, raw=pdu, timestamp=ts)
+        return None
+
+    def _score(self, evt: UDSEvent) -> bool:
+        """부정응답만 점수화. 설정 파일에 없는 NRC면 False(=무시)."""
+        if evt.response_type != "negative" or evt.code is None:
+            return True
+        base = self._nrc_score.get(evt.code)        # evt.code는 int
+        if base is None:
+            return False
+        ctx = self._ctx_mul.get(evt.service.lower(), 1.0)  # service는 '0x..' 소문자
+        evt.score = float(base) * float(ctx)
+        return True
