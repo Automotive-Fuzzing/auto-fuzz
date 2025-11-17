@@ -1,16 +1,21 @@
-from dataclasses import dataclass
-from typing import Optional, Dict, Tuple
-import time, os
+# src/monitor/uds_monitor.py
+import time
+import os
 import can
 import isotp
 import yaml
+from logger.base_logger import log_event
 
-CAN_CHANNEL         = "can0"
-TARGET_UDS_ID       = 0x366
-UDS_RESPONSE_OFFSET = 0x6A                 # 응답 ID = TARGET_UDS_ID + 0x6A
-PADDING_BYTE        = 0xAA                 # ISO-TP TX 패딩 바이트
 
-_ISOTP_PARAMS = {
+# 모니터링 설정값
+
+CAN_CHANNEL = "can0"
+TARGET_UDS_ID = 0x366
+UDS_RESPONSE_OFFSET = 0x6A
+PADDING_BYTE = 0xAA
+
+# ISO-TP 기본 설정
+isotp_params = {
     "stmin": 0,
     "blocksize": 8,
     "wftmax": 0,
@@ -20,175 +25,199 @@ _ISOTP_PARAMS = {
     "rx_consecutive_frame_timeout": 1000,
 }
 
-def load_nrc_config_strict(path: str) -> Tuple[Dict[int, float], Dict[str, float]]:
-    """
-    엄격 모드:
-      - 파일/필드/형식이 틀리면 즉시 예외
-      - nrc_scores: 키는 반드시 '0x..' 16진 문자열 → int로 변환
-      - context_multipliers: 키는 반드시 '0x..' 소문자 16진 문자열
-    """
-    if not path or not os.path.exists(path):
-        raise FileNotFoundError(f"UDSMonitor config not found: {path}")
+# 스코어 가중치 설정
+SCORE_NO_RESPONSE_0x10 = 1.0   # 세션 진입 실패 (가장 치명적)
+SCORE_NO_RESPONSE_0x3E = 0.8   # Tester Present 실패
+MAX_DTC_COUNT = 20              # DTC 개수 정규화 기준 (20개 이상이면 1.0)
+
+
+
+# NRC config 로드
+
+def load_nrc_config(path: str):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"NRC config not found: {path}")
 
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
 
-    if not isinstance(data, dict):
-        raise ValueError("Config YAML root must be a mapping")
+    if not isinstance(data, dict) or "nrc_scores" not in data:
+        raise ValueError("Invalid NRC config: missing 'nrc_scores'")
 
-    if "nrc_scores" not in data or "context_multipliers" not in data:
-        raise KeyError("Config must contain both 'nrc_scores' and 'context_multipliers'")
-
-    raw_scores = data["nrc_scores"]
-    raw_ctx    = data["context_multipliers"]
-
-    if not isinstance(raw_scores, dict) or not isinstance(raw_ctx, dict):
-        raise ValueError("'nrc_scores' and 'context_multipliers' must be mappings")
-
-    # nrc_scores: '0x..' 문자열 → int 키
-    nrc_scores: Dict[int, float] = {}
-    for k, v in raw_scores.items():
-        if not isinstance(k, str) or not k.strip().lower().startswith("0x"):
-            raise ValueError(f"NRC key must be hex string like '0x10', got {k!r}")
+    scores = {}
+    for k, v in data["nrc_scores"].items():
         try:
-            ki = int(k.strip().lower(), 16)
-            vf = float(v)
+            key = int(k, 16) if isinstance(k, str) and k.startswith("0x") else int(k)
+            scores[key] = float(v)
         except Exception as e:
-            raise ValueError(f"Invalid nrc_scores entry {k!r}:{v!r} → {e}")
-        nrc_scores[ki] = vf
-
-    # context_multipliers: '0x..' 소문자 16진 문자열
-    ctx_mul: Dict[str, float] = {}
-    for k, v in raw_ctx.items():
-        if not isinstance(k, str):
-            raise ValueError(f"Context key must be string like '0x10', got {type(k)}")
-        ks = k.strip().lower()
-        if not ks.startswith("0x"):
-            raise ValueError(f"Context key must start with '0x': {k!r}")
-        try:
-            int(ks, 16)  # 유효성 확인
-            vf = float(v)
-        except Exception as e:
-            raise ValueError(f"Invalid context_multipliers entry {k!r}:{v!r} → {e}")
-        ctx_mul[ks] = vf
-
-    if not nrc_scores:
-        raise ValueError("'nrc_scores' must not be empty")
-    if not ctx_mul:
-        raise ValueError("'context_multipliers' must not be empty")
-
-    return nrc_scores, ctx_mul
+            raise ValueError(f"Invalid NRC key/value {k}:{v} ({e})")
+    return scores
 
 
-@dataclass
-class UDSEvent:
-    service: str                 # "0x10", "0x3E", ...
-    response_type: str           # "positive" | "negative"
-    code: Optional[int]          # NRC (긍정은 None)
-    raw: bytes                   # 수신 UDS PDU
-    timestamp: float             # 수신 시각
-    score: float = 0.0           # 부정응답 위험 점수
 
+# UDS 모니터 클래스
 
 class UDSMonitor:
-    """
-    - 디폴트 제거: YAML 설정 필수
-    - __init__() : 버스/스택 준비 + 설정 로드
-    - start()    : 0x10 → 응답 처리 → positive면 0x3E까지
-    """
+    def __init__(self, nrc_cfg_path: str = "config/nrc_weights.yaml"):
+        # NRC 점수 테이블 로드
+        self.NRC_CLASS = load_nrc_config(nrc_cfg_path)
 
-    def __init__(self,
-                 bus: Optional[can.Bus] = None,
-                 tx_id: int = TARGET_UDS_ID,
-                 rx_id: int = TARGET_UDS_ID + UDS_RESPONSE_OFFSET,
-                 nrc_cfg_path: str = "config/nrc_weights.yaml"):
+        # CAN & ISO-TP 초기화
+        self.bus = can.interface.Bus(channel=CAN_CHANNEL, bustype="socketcan")
+        addr = isotp.Address(
+            isotp.AddressingMode.Normal_11bits,
+            txid=TARGET_UDS_ID,
+            rxid=TARGET_UDS_ID + UDS_RESPONSE_OFFSET
+        )
+        self.stack = isotp.CanStack(bus=self.bus, address=addr, params=isotp_params)
+        
+        # FAIL 스코어 누적 (0~1 범위)
+        self._fail_score = 0.0
 
-        self.bus = bus or can.interface.Bus(bustype="socketcan", channel=CAN_CHANNEL)
-        self.addr = isotp.Address(isotp.AddressingMode.Normal_11bits, txid=tx_id, rxid=rx_id)
-        self.stack = isotp.CanStack(bus=self.bus, address=self.addr, params=_ISOTP_PARAMS)
 
-        # 설정 필수 로드
-        self._nrc_score, self._ctx_mul = load_nrc_config_strict(nrc_cfg_path)
+    # ISO-TP 송신
 
-    def start(self,
-              session_sub: int = 0x01,
-              tester_sub: int = 0x00,
-              t1: float = 1.0,
-              t2: float = 1.0) -> Dict[str, Optional[UDSEvent]]:
-
-        result: Dict[str, Optional[UDSEvent]] = {"0x10": None, "0x3E": None}
-
-        # Step 1: 0x10
-        self._send_uds(bytes([0x10, session_sub]))
-        evt10 = self._recv_one(expected_sid=0x10, timeout=t1)
-        result["0x10"] = evt10
-
-        # Step 2: 0x3E (only if positive 0x10)
-        if evt10 and evt10.response_type == "positive":
-            self._send_uds(bytes([0x3E, tester_sub]))
-            evt3e = self._recv_one(expected_sid=0x3E, timeout=t2)
-            result["0x3E"] = evt3e
-
-        return result
-
-    def _send_uds(self, uds_pdu: bytes) -> None:
-        self.stack.send(uds_pdu)
+    def send_request(self, data):
+        
+        self.stack.send(bytes(data))
         while self.stack.transmitting():
             self.stack.process()
-            time.sleep(0.002)
+            time.sleep(0.01)
 
-    def _recv_one(self, expected_sid: int, timeout: float) -> Optional[UDSEvent]:
-        """
-        기대 서비스(예: 0x10/0x3E)의 응답 1건 동기 수신.
-        - 0x7F: 설정된 NRC만 스코어링(미정의 NRC는 continue)
-        - positive: 그대로 반환
-        - timeout: None
-        """
-        deadline = time.time() + timeout
-        expected_tag = f"0x{expected_sid:02X}".lower()
+    # ISO-TP 수신
 
-        while time.time() < deadline:
+    def recv_response(self, timeout=1.0):
+     
+        start = time.time()
+        while time.time() - start < timeout:
             self.stack.process()
             if self.stack.available():
-                pdu = self.stack.recv()
-                ts = time.time()
-
-                evt = self._parse_uds_pdu(pdu, ts)
-                if not evt:
-                    continue
-                if evt.service.lower() != expected_tag:
-                    continue
-                if evt.response_type == "negative":
-                    if not self._score(evt):   # 미정의 NRC면 continue
-                        continue
-                return evt
-
-            time.sleep(self.stack.sleep_time())
-
+                resp = list(self.stack.recv())
+                 # ➜ 0x7F 0x78(Response Pending) → 아직 최종 응답이 아님, 타임아웃 안에서 재시도
+                if len(resp) >= 3 and resp[0] == 0x7F and resp[2] == 0x78:
+                    log_event("uds", TARGET_UDS_ID, "NRC_0x78_pending", "wait_more", "INFO")
+                    continue  # 최종 응답 올 때까지 루프 계속
+                return resp
+            time.sleep(0.01)
         return None
 
-    @staticmethod
-    def _parse_uds_pdu(pdu: bytes, ts: float) -> Optional[UDSEvent]:
-        if not pdu:
-            return None
-        # Negative: 0x7F <req_sid> <nrc>
-        if len(pdu) >= 3 and pdu[0] == 0x7F:
-            return UDSEvent(service=f"0x{pdu[1]:02X}", response_type="negative",
-                            code=pdu[2], raw=pdu, timestamp=ts)
-        # Positive: 0x40 + <req_sid>
-        if pdu[0] >= 0x40:
-            sid = pdu[0] - 0x40
-            return UDSEvent(service=f"0x{sid:02X}", response_type="positive",
-                            code=None, raw=pdu, timestamp=ts)
-        return None
 
-    def _score(self, evt: UDSEvent) -> bool:
-        """부정응답만 점수화. 설정 파일에 없는 NRC면 False(=무시)."""
-        if evt.response_type != "negative" or evt.code is None:
-            return True
-        base = self._nrc_score.get(evt.code)        # evt.code는 int
-        if base is None:
-            return False
-        ctx = self._ctx_mul.get(evt.service.lower(), 1.0)  # service는 '0x..' 소문자
-        evt.score = float(base) * float(ctx)
+    def start(self) -> float:
+        """
+        UDS 모니터링 시작
+        
+        :return: 최종 FAIL 스코어 (0.0 ~ 1.0+)
+        """
+        self._fail_score = 0.0  # 스코어 초기화
+        
+        try:
+            # 0x10 세션 진입
+            if not self._send_once_or_retry([0x10, 0x02], "session_entry", SCORE_NO_RESPONSE_0x10):
+                print("[INFO] UDS Monitor finished - Session entry failed")
+                return min(self._fail_score, 1.0)  # 1.0으로 제한
+
+            # 0x3E Tester Present
+            if not self._send_once_or_retry([0x3E, 0x00], "tester_present", SCORE_NO_RESPONSE_0x3E):
+                print("[INFO] UDS Monitor finished - Tester present failed")
+                return min(self._fail_score, 1.0)
+
+            # 0x19 DTC 읽기
+            self.send_request([0x19, 0x02])
+            total_dtc = self.collect_all_dtc()
+            
+            # DTC 스코어 계산 (0 ~ 1.0)
+            dtc_score = min(total_dtc / MAX_DTC_COUNT, 1.0)
+            self._fail_score += dtc_score
+            
+            log_event("uds", TARGET_UDS_ID, "DTC_count", total_dtc, "OK" if total_dtc == 0 else "FAIL")
+            log_event("uds", TARGET_UDS_ID, "DTC_score", dtc_score, "OK" if dtc_score < 0.5 else "FAIL")
+
+        except Exception as e:
+            log_event("uds", TARGET_UDS_ID, "exception", str(e), "FAIL")
+            self._fail_score = 1.0  # 예외 발생 시 최대 스코어
+        
+        # 최종 스코어는 1.0을 초과할 수 있음 (여러 FAIL이 누적될 경우)
+        print(f"[INFO] UDS Monitor finished - Total FAIL score: {self._fail_score:.3f}")
+        return self._fail_score
+
+    # 1회 전송 + 1회 재시도
+
+    def _send_once_or_retry(self, data, step_name, no_response_score):
+        """
+        요청 보내고 응답 확인, 없으면 한 번만 재시도
+        
+        :param data: 전송할 UDS 요청 데이터
+        :param step_name: 단계 이름 (로깅용)
+        :param no_response_score: 응답 없을 때 부여할 스코어 (0~1)
+        :return: 성공 여부
+        """
+        # 1차 요청
+        self.send_request(data)
+        resp = self.recv_response(timeout=1.0)
+
+        if not resp:
+            # 응답이 없으면 한 번만 재시도
+            self.send_request(data)
+            resp = self.recv_response(timeout=1.0)
+
+            if not resp:
+                self._fail_score += no_response_score
+                log_event("uds", TARGET_UDS_ID, f"{step_name}_no_response", no_response_score, "FAIL")
+                return False
+
+        # NRC 응답
+        if resp[0] == 0x7F:
+            nrc = resp[2]
+            if nrc in self.NRC_CLASS:
+                score = self.NRC_CLASS[nrc]
+                self._fail_score += score
+                log_event("uds", TARGET_UDS_ID, f"NRC_{hex(nrc)}", score, "FAIL")
+                return False
+            else:
+                # 알 수 없는 NRC는 정상으로 처리
+                log_event("uds", TARGET_UDS_ID, f"NRC_unknown_{hex(nrc)}", nrc, "WARN")
+                return True
+
+        # 정상 응답
+        log_event("uds", TARGET_UDS_ID, step_name, "response_ok", "OK")
         return True
+
+ 
+
+    #0x59 0x02 DTC 개수 계산
+    def collect_all_dtc(self):
+        
+        accumulated_data = bytearray()
+        start_time = time.time()
+
+        while time.time() - start_time < 2.0:
+            resp = self.recv_response(timeout=0.5)
+            if not resp:
+                break
+
+            # 정상 DTC 응답
+            if len(resp) >= 4 and resp[0] == 0x59 and resp[1] == 0x02:
+                # status mask(resp[2]) 건너뛰고 resp[3:]부터 누적
+                accumulated_data.extend(resp[3:])
+
+            # NRC 응답
+            elif resp[0] == 0x7F:
+                nrc = resp[2]
+                if nrc in self.NRC_CLASS:
+                    score = self.NRC_CLASS[nrc]
+                    self._fail_score += score
+                    log_event("uds", TARGET_UDS_ID, f"DTC_NRC_{hex(nrc)}", score, "FAIL")
+                else:
+                    log_event("uds", TARGET_UDS_ID, "DTC_NRC_Unknown", nrc, "WARN")
+                continue
+
+        total_dtc = len(accumulated_data) // 4  # 3바이트 코드 + 1바이트 상태
+        return total_dtc
+    
+    
+    def get_fail_score(self) -> float:
+        """
+        현재까지 누적된 FAIL 스코어 반환
+        0~1 범위
+        """
+        return self._fail_score
