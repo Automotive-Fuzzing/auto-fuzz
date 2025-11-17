@@ -25,6 +25,11 @@ isotp_params = {
     "rx_consecutive_frame_timeout": 1000,
 }
 
+# 스코어 가중치 설정
+SCORE_NO_RESPONSE_0x10 = 1.0   # 세션 진입 실패 (가장 치명적)
+SCORE_NO_RESPONSE_0x3E = 0.8   # Tester Present 실패
+MAX_DTC_COUNT = 20              # DTC 개수 정규화 기준 (20개 이상이면 1.0)
+
 
 
 # NRC config 로드
@@ -65,6 +70,9 @@ class UDSMonitor:
             rxid=TARGET_UDS_ID + UDS_RESPONSE_OFFSET
         )
         self.stack = isotp.CanStack(bus=self.bus, address=addr, params=isotp_params)
+        
+        # FAIL 스코어 누적 (0~1 범위)
+        self._fail_score = 0.0
 
 
     # ISO-TP 송신
@@ -90,29 +98,55 @@ class UDSMonitor:
 
 
 
-    def start(self):
+    def start(self) -> float:
+        """
+        UDS 모니터링 시작
+        
+        :return: 최종 FAIL 스코어 (0.0 ~ 1.0+)
+        """
+        self._fail_score = 0.0  # 스코어 초기화
+        
         try:
             # 0x10 세션 진입
-            if not self._send_once_or_retry([0x10, 0x02], "session_entry"):
-                return
+            if not self._send_once_or_retry([0x10, 0x02], "session_entry", SCORE_NO_RESPONSE_0x10):
+                print("[INFO] UDS Monitor finished - Session entry failed")
+                return min(self._fail_score, 1.0)  # 1.0으로 제한
 
             # 0x3E Tester Present
-            if not self._send_once_or_retry([0x3E, 0x00], "tester_present"):
-                return
+            if not self._send_once_or_retry([0x3E, 0x00], "tester_present", SCORE_NO_RESPONSE_0x3E):
+                print("[INFO] UDS Monitor finished - Tester present failed")
+                return min(self._fail_score, 1.0)
 
             # 0x19 DTC 읽기
             self.send_request([0x19, 0x02])
             total_dtc = self.collect_all_dtc()
-            value = total_dtc / 20.0
-            log_event("uds", TARGET_UDS_ID, "DTC_total_score", value, "OK")
+            
+            # DTC 스코어 계산 (0 ~ 1.0)
+            dtc_score = min(total_dtc / MAX_DTC_COUNT, 1.0)
+            self._fail_score += dtc_score
+            
+            log_event("uds", TARGET_UDS_ID, "DTC_count", total_dtc, "OK" if total_dtc == 0 else "FAIL")
+            log_event("uds", TARGET_UDS_ID, "DTC_score", dtc_score, "OK" if dtc_score < 0.5 else "FAIL")
 
         except Exception as e:
             log_event("uds", TARGET_UDS_ID, "exception", str(e), "FAIL")
+            self._fail_score = 1.0  # 예외 발생 시 최대 스코어
+        
+        # 최종 스코어는 1.0을 초과할 수 있음 (여러 FAIL이 누적될 경우)
+        print(f"[INFO] UDS Monitor finished - Total FAIL score: {self._fail_score:.3f}")
+        return self._fail_score
 
     # 1회 전송 + 1회 재시도
 
-    def _send_once_or_retry(self, data, step_name):
-        """요청 보내고 응답 확인, 없으면 한 번만 재시도"""
+    def _send_once_or_retry(self, data, step_name, no_response_score):
+        """
+        요청 보내고 응답 확인, 없으면 한 번만 재시도
+        
+        :param data: 전송할 UDS 요청 데이터
+        :param step_name: 단계 이름 (로깅용)
+        :param no_response_score: 응답 없을 때 부여할 스코어 (0~1)
+        :return: 성공 여부
+        """
         # 1차 요청
         self.send_request(data)
         resp = self.recv_response(timeout=1.0)
@@ -123,7 +157,8 @@ class UDSMonitor:
             resp = self.recv_response(timeout=1.0)
 
             if not resp:
-                log_event("uds", TARGET_UDS_ID, f"{step_name}_no_response", "high", "FAIL")
+                self._fail_score += no_response_score
+                log_event("uds", TARGET_UDS_ID, f"{step_name}_no_response", no_response_score, "FAIL")
                 return False
 
         # NRC 응답
@@ -131,9 +166,12 @@ class UDSMonitor:
             nrc = resp[2]
             if nrc in self.NRC_CLASS:
                 score = self.NRC_CLASS[nrc]
+                self._fail_score += score
                 log_event("uds", TARGET_UDS_ID, f"NRC_{hex(nrc)}", score, "FAIL")
                 return False
             else:
+                # 알 수 없는 NRC는 정상으로 처리
+                log_event("uds", TARGET_UDS_ID, f"NRC_unknown_{hex(nrc)}", nrc, "WARN")
                 return True
 
         # 정상 응답
@@ -163,10 +201,19 @@ class UDSMonitor:
                 nrc = resp[2]
                 if nrc in self.NRC_CLASS:
                     score = self.NRC_CLASS[nrc]
-                    log_event("uds", TARGET_UDS_ID, f"NRC_{hex(nrc)}", score, "FAIL")
+                    self._fail_score += score
+                    log_event("uds", TARGET_UDS_ID, f"DTC_NRC_{hex(nrc)}", score, "FAIL")
                 else:
                     log_event("uds", TARGET_UDS_ID, "DTC_NRC_Unknown", nrc, "WARN")
                 continue
 
         total_dtc = len(accumulated_data) // 4  # 3바이트 코드 + 1바이트 상태
         return total_dtc
+    
+    
+    def get_fail_score(self) -> float:
+        """
+        현재까지 누적된 FAIL 스코어 반환
+        0~1 범위
+        """
+        return self._fail_score

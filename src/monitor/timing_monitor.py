@@ -3,6 +3,7 @@
 import can
 import time
 from logger.base_logger import log_event
+from typing import Optional
 
 
 # 모니터링 설정값 
@@ -38,17 +39,32 @@ class TimingMonitor:
         self.events = []          # 발생한 이벤트 버퍼
         self._frame_counter = 0   # 평균 주기 계산용 카운터
         self._cycle_list = []     # 최근 N개의 주기 기록
+        self._fail_score = 0.0    # FAIL 스코어 누적
 
 
-    def start(self):
+    def start(self, timeout: Optional[float] = None) -> float:
         """
         모니터링 루프 시작.
         지정된 CAN ID의 메시지를 수신하며, 주기 위배 여부를 검사한다.
+        
+        :param timeout: 모니터링 시간 제한(초). None이면 무제한
+        :return: 최종 FAIL 스코어
         """
         print(f"[ INFO ] Monitoring 0x{self.target_id:X} "
               f"(Cycle={self.expected}ms ±{self.tolerance}ms) on {self.channel}")
+        
+        if timeout:
+            print(f"[ INFO ] Timeout set to {timeout} seconds")
+        
+        start_time = time.time()
+        self._fail_score = 0.0  # 스코어 초기화
 
         while True:
+            # timeout 체크
+            if timeout and (time.time() - start_time) >= timeout:
+                print(f"[ INFO ] Timing Monitor timeout reached ({timeout}s)")
+                break
+            
             msg = self.bus.recv(timeout=1)
             if not msg:
                 continue
@@ -61,6 +77,16 @@ class TimingMonitor:
             if self.prev_time:
                 cycle = now - self.prev_time
                 status = "OK" if (self.expected - self.tolerance <= cycle <= self.expected + self.tolerance) else "FAIL"
+
+                # FAIL인 경우 스코어 누적 (오차의 절댓값)
+                if status == "FAIL":
+                    if cycle < self.expected - self.tolerance:
+                        # 너무 빠름
+                        error = (self.expected - self.tolerance) - cycle
+                    else:
+                        # 너무 느림
+                        error = cycle - (self.expected + self.tolerance)
+                    self._fail_score += error
 
                 # 이벤트 생성 및 저장
                 event = {
@@ -86,6 +112,18 @@ class TimingMonitor:
                     print(f"    └ Average cycle (last {LOG_INTERVAL}): {avg_cycle:.2f} ms")
 
             self.prev_time = now
+        
+        print(f"[ INFO ] Timing Monitor finished - Total FAIL score: {self._fail_score:.2f}")
+        return self._fail_score
+
+
+    def get_fail_score(self) -> float:
+        """
+        현재까지 누적된 FAIL 스코어 반환
+        
+        :return: FAIL 스코어 (허용 범위를 벗어난 오차의 누적합)
+        """
+        return self._fail_score
 
 
     def fetch_events(self):

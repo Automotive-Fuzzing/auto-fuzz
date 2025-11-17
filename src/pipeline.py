@@ -1,15 +1,19 @@
 # src/pipeline.py
 import time
+import json
+from typing import Optional, Dict, Any
+
 from seeds.dbc_parser import DbcParser
 from seeds.seed_manager import SeedManager, Seed
 from seeds.seed_queue import SeedQueue
-from typing import Optional
+
+from monitor.monitor_manager import MonitorManager
+from monitor.timing_monitor import TimingMonitor
+from monitor.uds_monitor import UDSMonitor
+from monitor.dbc_monitor import DBCMonitor
 
 
 class AutoFuzzPipeline:
-    """Seed DB 기반 CAN 송신 파이프라인"""
-
-    # Seed 등록 및 조회
     @staticmethod
     def register_seeds(dbc_path: str, db_path: str = "seeds.db") -> int:
         parser = DbcParser(dbc_path)
@@ -35,20 +39,18 @@ class AutoFuzzPipeline:
         manager.close()
         return seeds
 
-
-    # 초기화 및 송신
     def __init__(self, db_path: str = "seeds.db", can_iface: Optional[object] = None):
-        """
-        db_path: Seed DB 경로
-        can_iface: CLI에서 전달받은 CANInterface (없으면 stub 모드)
-         = CLI에서 --can 옵션을 주지 않는 경우, 터미널 출력만 보이는 stub 모드
-        """
         self.queue = SeedQueue(db_path)
         self.can = can_iface
         self.running = False
 
+        self.monitor_manager = MonitorManager(
+            timing_monitor=TimingMonitor(),
+            uds_monitor=UDSMonitor(),
+            dbc_monitor=DBCMonitor()
+        )
+
     def send(self, seed: Seed):
-        """Seed를 CAN으로 송신 (seed.message_id 우선, 없으면 fallback)"""
         if not self.can:
             arb = seed.message_id or 0x6A6
             print(f"[Stub:Tx] ID={hex(arb)} | Signal={seed.signal_name:<25}")
@@ -67,30 +69,47 @@ class AutoFuzzPipeline:
         except Exception as e:
             print(f"[!] CAN send error: {e}")
 
-
-    # 실행 루프
-    def run(self):
-        """Seed 큐 순회하며 송신"""
+    def run(self) -> Dict[str, Any]:
+        """
+        퍼징 + 모니터링을 수행하고 최종 결과 딕셔너리로 반환한다.
+        CLI 쪽에서 출력/저장하도록 함.
+        """
         self.running = True
-        print("[+] Auto-Fuzz pipeline started (mutation/monitor disabled).")
 
+        # 모니터 실행
+        self.monitor_manager.start_monitors(timing_timeout=5.0)
+
+        # CAN Listener 시작
         if self.can:
             try:
                 self.can.start_listener()
             except Exception as e:
                 print(f"[!] CAN listener start failed: {e}")
 
+        # Fuzzing Loop
         while self.running:
             seed = self.queue.pop()
             if not seed:
-                print("[!] No more seeds. Stopping.")
                 break
 
             self.send(seed)
             time.sleep(0.2)
 
+        # 종료 처리
         if self.can:
             self.can.stop_listener()
 
-        print("[✓] Fuzzing complete.")
+        self.monitor_manager.wait_for_completion()
+
+        scores = self.monitor_manager.get_scores()
+        status = self.monitor_manager.get_completion_status()
+
+        # 파이프라인 종료
         self.queue.close()
+
+        # 결과 딕셔너리 리턴
+        return {
+            "timing": {"score": scores["timing"], "completed": status["timing"]},
+            "uds": {"score": scores["uds"], "completed": status["uds"]},
+            "dbc": {"score": scores["dbc"], "completed": status["dbc"]},
+        }
