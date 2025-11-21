@@ -1,10 +1,23 @@
 import random
 from typing import Dict
-from logger.base_logger import log_event   # [추가] 예외 로깅용
+from logger.base_logger import log_event  
 
+<<<<<<< Updated upstream
+=======
+DEFAULT_BYTE_K_PROB   = 0.3  
+DEFAULT_BYTE_WEIGHT = 1.0  
+DEFAULT_EDGE_BIAS     = 0.0  
+
+DEFAULT_BIT_K_PROB    = 0.4  
+DEFAULT_BIT_WEIGHT  = 1.0  
+DEFAULT_MSB_BIAS      = 0.0  
+DEFAULT_LSB_BIAS      = 0.0  
+DEFAULT_BUDGET        = 256
+DEFAULT_MAX_OPS       = 3
+>>>>>>> Stashed changes
 
 class Mutator:
-    def __init__(self, data: bytes, weights: Dict[str, float], min_length: int = 1):  # [추가] min_length
+    def __init__(self, data: bytes, weights: Dict[str, float], min_length: int = 1):  
         """
         data: 변이 대상 원본 데이터 (bytes)
         weights: monitor로부터 전달받은 가중치 딕셔너리
@@ -12,7 +25,7 @@ class Mutator:
         """
         self.data = bytearray(data)
         self.weights = weights
-        self.min_length = min_length  # [추가] 최소 길이 제한
+        self.min_length = min_length  
 
     def mutate_manager(self) -> list[bytes]:
         budget        = int(self.weights.get("manager.budget", 256))
@@ -40,7 +53,6 @@ class Mutator:
         attempt_cap = budget * 20
         attempts = 0
 
-        # [추가] mutate_manager 전체 예외 방어
         try:
             while len(out) < budget and attempts < attempt_cap:
                 attempts += 1
@@ -63,7 +75,6 @@ class Mutator:
                         try:
                             getattr(self, op_kind)()
                         except Exception as e:
-                            # [추가] 예외 발생시 CLI + 파일 동시 로그
                             print(f"[!] Mutation 실패: {op_kind} ({type(e).__name__})")
                             log_event(
                                 source="mutator",
@@ -78,7 +89,7 @@ class Mutator:
                 finally:
                     self.data = saved
 
-        except Exception as e:  # [추가] 전체 보호
+        except Exception as e:  
             print(f"[!] mutate_manager 전체 예외 발생: {type(e).__name__} - {e}")
             log_event("mutator", 0x00, "mutate_manager", str(type(e).__name__), "FAIL")
             self.data = bytearray(base)
@@ -86,12 +97,10 @@ class Mutator:
         self.generated = out
         return out
 
-    # -----------------------------
-    # 🔹 Bit-level mutation
-    # -----------------------------
+    #  Bit-level mutation
     def flip_bit(self) -> None:
         """랜덤 바이트 내 특정 비트를 flip"""
-        try:  # [추가] 방어
+        try: 
             byte_idxs = self.select_random_byte()
             if isinstance(byte_idxs, int):
                 byte_idxs = [byte_idxs]
@@ -108,7 +117,7 @@ class Mutator:
                 return
             bit_idx = random.choice(bit_idxs)
             self.data[byte_idx] ^= (1 << bit_idx)
-        except Exception as e:  # [추가]
+        except Exception as e:  
             print(f"[!] flip_bit 예외 발생: {type(e).__name__}")
             log_event("mutator", 0x00, "flip_bit", str(type(e).__name__), "FAIL")
 
@@ -133,7 +142,7 @@ class Mutator:
             mask = (1 << bit_idx)
             if (self.data[byte_idx] & mask) == 0:
                 self.data[byte_idx] |= mask
-        except Exception as e:  # [추가]
+        except Exception as e:  
             print(f"[!] increment_bit 예외 발생: {type(e).__name__}")
             log_event("mutator", 0x00, "increment_bit", str(type(e).__name__), "FAIL")
 
@@ -158,7 +167,7 @@ class Mutator:
             mask = (1 << bit_idx)
             if (self.data[byte_idx] & mask) != 0:
                 self.data[byte_idx] &= ~mask
-        except Exception as e:  # [추가]
+        except Exception as e: 
             print(f"[!] decrement_bit 예외 발생: {type(e).__name__}")
             log_event("mutator", 0x00, "decrement_bit", str(type(e).__name__), "FAIL")
 
@@ -172,7 +181,7 @@ class Mutator:
             byte_idx = random.choice(byte_idxs)
             if 0 <= byte_idx < len(self.data):
                 self.data[byte_idx] = (self.data[byte_idx] + 1) & 0xFF
-        except Exception as e:  # [추가]
+        except Exception as e: 
             print(f"[!] increment_byte 예외 발생: {type(e).__name__}")
             log_event("mutator", 0x00, "increment_byte", str(type(e).__name__), "FAIL")
 
@@ -186,7 +195,7 @@ class Mutator:
             byte_idx = random.choice(byte_idxs)
             if 0 <= byte_idx < len(self.data):
                 self.data[byte_idx] = (self.data[byte_idx] - 1) & 0xFF
-        except Exception as e:  # [추가]
+        except Exception as e:  
             print(f"[!] decrement_byte 예외 발생: {type(e).__name__}")
             log_event("mutator", 0x00, "decrement_byte", str(type(e).__name__), "FAIL")
 
@@ -195,13 +204,13 @@ class Mutator:
             insert_pos = random.randint(0, len(self.data))
             new_val = random.randint(0, 255)
             self.data.insert(insert_pos, new_val)
-        except Exception as e:  # [추가]
+        except Exception as e:  
             print(f"[!] insert_byte 예외 발생: {type(e).__name__}")
             log_event("mutator", 0x00, "insert_byte", str(type(e).__name__), "FAIL")
 
     def delete_byte(self) -> None:
         try:
-            if len(self.data) <= self.min_length:  # [추가] 최소 길이 방어
+            if len(self.data) <= self.min_length:  
                 return
             del_idxs = self.select_random_byte()
             if isinstance(del_idxs, int):
@@ -211,13 +220,11 @@ class Mutator:
             del_pos = random.choice(del_idxs)
             if 0 <= del_pos < len(self.data):
                 del self.data[del_pos]
-        except Exception as e:  # [추가]
+        except Exception as e:  
             print(f"[!] delete_byte 예외 발생: {type(e).__name__}")
             log_event("mutator", 0x00, "delete_byte", str(type(e).__name__), "FAIL")
 
-    # -----------------------------
-    # 🔹 Utility selectors
-    # -----------------------------
+    #  Utility selectors
     def select_random_byte(self) -> list[int]:
         n = len(self.data)
         if n == 0:
