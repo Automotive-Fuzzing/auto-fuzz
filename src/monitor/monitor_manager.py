@@ -1,5 +1,5 @@
 import threading
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 from .timing_monitor import TimingMonitor
 from .uds_monitor import UDSMonitor
 from .dbc_monitor import DBCMonitor
@@ -242,6 +242,20 @@ class MonitorManager:
     def get_scores(self) -> Dict[str, float]:
         with self.state_lock:
             return self.scores.copy()
+
+    def collect_results(
+        self,
+        timing_timeout: Optional[float] = 5.0,
+        dbc_timeout: Optional[float] = 5.0,
+    ) -> Dict[str, Any]:
+        timeout = max(timing_timeout or 0.0, dbc_timeout or 0.0)
+        self.wait_for_completion(timeout=timeout)
+        scores = self.get_scores()
+        status = self.get_status()
+        return {
+            name: {"score": scores[name], "status": status[name]}
+            for name in ("timing", "uds", "dbc")
+        }
 
     def is_running(self) -> bool:
         return self.running

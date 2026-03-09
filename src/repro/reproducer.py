@@ -12,12 +12,12 @@ from .storage import ReproStorage
 @runtime_checkable
 class TxLog(Protocol):
 
-    def get_frame_window(
+    def get_window(
         self,
-        center_idx: int,
+        anchor_send_idx: int,
         pre: int,
         post: int,
-    ) -> List[Tuple[int, bytes]]: ...
+    ) -> List[Any]: ...
 
 
 class Reproducer:
@@ -78,7 +78,8 @@ class Reproducer:
             print(f"[Reproducer] -- trial {i + 1}/{n} --")
 
             # replay -> monitor 수집
-            self.can_iface.replay(frames)
+            for arb_id, payload in frames:
+                self.can_iface.send_raw(payload, arb_id=arb_id)
             result = self.monitor_manager.collect_results(
                 timing_timeout=timing_timeout,
                 dbc_timeout=dbc_timeout,
@@ -117,12 +118,16 @@ class Reproducer:
         
         if self.tx_log is not None and candidate.last_send_idx is not None:
             try:
-                frames = self.tx_log.get_frame_window(
+                raw = self.tx_log.get_window(
                     candidate.last_send_idx,
                     pre=self.pre_window,
                     post=self.post_window,
                 )
-                if frames:
+                if raw:
+                    frames = [
+                        (f.arb_id, f.payload) if hasattr(f, "arb_id") else f
+                        for f in raw
+                    ]
                     print(
                         f"[Reproducer] tx_log 윈도우: center={candidate.last_send_idx} "
                         f"pre={self.pre_window} post={self.post_window} -> {len(frames)} frames"
