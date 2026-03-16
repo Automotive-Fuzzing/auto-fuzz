@@ -1,91 +1,141 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional, Protocol, Tuple, runtime_checkable
 
-# 파이프라인 전체에서 monitor 이름 순서 통일
-MONITOR_NAMES: tuple[str, ...] = ("timing", "uds", "dbc")
-
-_FAIL_STATUSES = frozenset({"crashed", "timeout"})
-
-
-@dataclass
-class MonitorSummary:
-    name: str
-    fail_count: int         # 몇 번의 trial에서 fail 판정
-    fail_bitmap: List[int]  # 길이 n, trial별 1(fail) / 0(pass)
-    scores: List[float]     # trial별 원시 score
-    mean_score: float       # 평균 score
+from .candidate import CandidateSnapshot
+from .evidence_fusion import EvidenceFusion, FusionResult
+from .report import ResultFrame
+from .storage import ReproStorage
 
 
-@dataclass
-class ResultFrame:
-    seed_id: int
-    trials: int                             # n
-    reproduced: int                         # k: 하나 이상의 monitor가 fail한 trial 수
-    reproduction_rate: float                # k / n
-    monitor_summary: Dict[str, MonitorSummary]
-    trial_results: List[Dict[str, Any]]     # per-trial raw (top_n 적용 후)
+@runtime_checkable
+class TxLog(Protocol):
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "seed_id": self.seed_id,
-            "trials": self.trials,
-            "reproduced": self.reproduced,
-            "reproduction_rate": self.reproduction_rate,
-            "monitor_summary": {
-                name: asdict(s) if isinstance(s, MonitorSummary) else dict(s)
-                for name, s in self.monitor_summary.items()
-            },
-            "trial_results": self.trial_results,
-        }
+    def get_window(
+        self,
+        anchor_send_idx: int,
+        pre: int,
+        post: int,
+    ) -> List[Any]: ...
 
-    @staticmethod
-    def from_trial_results(
-        seed_id: int,
-        trial_results: List[Dict[str, Any]],
+
+class Reproducer:
+
+
+    def __init__(
+        self,
+        can_iface,
+        monitor_manager,
+        storage: ReproStorage,
+        fusion: Optional[EvidenceFusion] = None,
         *,
+        tx_log: Optional[TxLog] = None,
+        pre_window: int = 5,
+        post_window: int = 2,
+        trial_gap: float = 0.1,
+        under_load: bool = False,
+    ) -> None:
+       
+        self.can_iface = can_iface
+        self.monitor_manager = monitor_manager
+        self.storage = storage
+        self.fusion = fusion or EvidenceFusion()
+        self.tx_log = tx_log
+        self.pre_window = pre_window
+        self.post_window = post_window
+        self.trial_gap = trial_gap
+        self.under_load = under_load
+
+        if under_load:
+            print("[WARN] under_load=True: 배경 트래픽 유지는 현재 미구현 (stub)")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def run(
+        self,
+        candidate: CandidateSnapshot,
+        n: int = 5,
+        *,
+        timing_timeout: float = 5.0,
+        dbc_timeout: float = 5.0,
         top_n: Optional[int] = None,
-    ) -> "ResultFrame":
+        report_mode: str = "fixed",
+    ) -> Tuple[ResultFrame, FusionResult]:
+     
+        print(
+            f"[Reproducer] seed_id={candidate.id} | n={n} | "
+            f"arb_id={hex(candidate.arb_id)} | payload={candidate.payload.hex()}"
+        )
+
+        frames = self._restore_frames(candidate)
+        print(f"[Reproducer] replay 프레임 수: {len(frames)}")
+
+        trial_results: List[Dict[str, Any]] = []
+        for i in range(n):
+            print(f"[Reproducer] -- trial {i + 1}/{n} --")
+
+            # replay -> monitor 수집
+            for arb_id, payload in frames:
+                self.can_iface.send_raw(payload, arb_id=arb_id)
+            result = self.monitor_manager.collect_results(
+                timing_timeout=timing_timeout,
+                dbc_timeout=dbc_timeout,
+            )
+            trial_results.append(result)
+
+            if i < n - 1:
+                time.sleep(self.trial_gap)
+
+        # 7단계: ResultFrame 생성 + verdict 판정
+        frame = ResultFrame.from_trial_results(candidate.id, trial_results, top_n=top_n)
+        fusion_result = self.fusion.evaluate(frame)
+
+        print(
+            f"[Reproducer] verdict={fusion_result.verdict} | "
+            f"repro_rate={fusion_result.repro_rate:.2f} | "
+            f"fusion_score={fusion_result.fusion_score:.4f}"
+        )
+
+        # 8단계: candidate 업데이트 후 storage 저장
+        candidate.repro_verdict = fusion_result.verdict
+        candidate.repro_rate = fusion_result.repro_rate
+        candidate.repro_json = frame.to_dict()
+        candidate.last_evidence = fusion_result.detail
+
+        self.storage.save_candidate(candidate.id, candidate)
+        self.storage.save_report(candidate.id, frame.to_dict(), mode=report_mode)
+
+        return frame, fusion_result
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _restore_frames(self, candidate: CandidateSnapshot) -> List[Tuple[int, bytes]]:
         
-        n = len(trial_results)
-        if n == 0:
-            return ResultFrame(
-                seed_id=seed_id, trials=0, reproduced=0,
-                reproduction_rate=0.0, monitor_summary={}, trial_results=[],
-            )
+        if self.tx_log is not None and candidate.last_send_idx is not None:
+            try:
+                raw = self.tx_log.get_window(
+                    candidate.last_send_idx,
+                    pre=self.pre_window,
+                    post=self.post_window,
+                )
+                if raw:
+                    frames = [
+                        (f.arb_id, f.payload) if hasattr(f, "arb_id") else f
+                        for f in raw
+                    ]
+                    print(
+                        f"[Reproducer] tx_log 윈도우: center={candidate.last_send_idx} "
+                        f"pre={self.pre_window} post={self.post_window} -> {len(frames)} frames"
+                    )
+                    return frames
+                print("[Reproducer] tx_log 윈도우가 비어 있음 -> fallback")
+            except Exception as e:
+                print(f"[Reproducer] tx_log 오류 -> fallback ({e})")
 
-        summaries: Dict[str, MonitorSummary] = {}
-        for name in MONITOR_NAMES:
-            scores: List[float] = []
-            bitmap: List[int] = []
-
-            for tr in trial_results:
-                mv = tr.get(name, {})
-                score = float(mv.get("score", 0.0))
-                status = str(mv.get("status", "ok"))
-                scores.append(score)
-                bitmap.append(1 if (score > 0.0 or status in _FAIL_STATUSES) else 0)
-
-            summaries[name] = MonitorSummary(
-                name=name,
-                fail_count=sum(bitmap),
-                fail_bitmap=bitmap,
-                scores=scores,
-                mean_score=round(sum(scores) / n, 4),
-            )
-
-        # 하나 이상의 monitor가 fail한 trial 수 (k)
-        reproduced = sum(
-            1 for i in range(n)
-            if any(summaries[m].fail_bitmap[i] for m in MONITOR_NAMES)
-        )
-
-        return ResultFrame(
-            seed_id=seed_id,
-            trials=n,
-            reproduced=reproduced,
-            reproduction_rate=round(reproduced / n, 4),
-            monitor_summary=summaries,
-            trial_results=trial_results if top_n is None else trial_results[:top_n],
-        )
+        print("[Reproducer] fallback: 단일 프레임 (arb_id, payload)")
+        return [(candidate.arb_id, candidate.payload)]
