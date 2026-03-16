@@ -1,191 +1,406 @@
 # src/pipeline.py
 
-import time
+from __future__ import annotations
+
 import json
-from typing import Optional, Dict, Any
+import time
+from typing import Any, Dict, List, Optional
 
-from .seeds.dbc_parser import DbcParser
-from .seeds.seed_manager import SeedManager, Seed
-from .seeds.seed_queue import SeedQueue
-
+from .monitor.dbc_monitor import DBCMonitor
 from .monitor.monitor_manager import MonitorManager
 from .monitor.timing_monitor import TimingMonitor
 from .monitor.uds_monitor import UDSMonitor
-from .monitor.dbc_monitor import DBCMonitor
+from .repro.candidate import CandidateSnapshot
+from .repro.evidence_fusion import HARD_FAIL, SOFT_FAIL, EvidenceFusion
+from .repro.report import MONITOR_NAMES, ResultFrame
+from .repro.storage import ReproStorage
+from .seeds.dbc_parser import DbcParser
+from .seeds.factory import build_initial_seeds_from_parsed_dbc
+from .seeds.mutation_engine import MutationEngine
+from .seeds.seed_manager import Seed, SeedManager
+from .seeds.seed_queue import SeedQueue
+from .seeds.tx_log import TxFrame, TxLog
 
-from .mutation.mutator import Mutator
+FAIL_STATUSES = frozenset({"crashed", "timeout"})
 
 
 class AutoFuzzPipeline:
-    
-    # 시드 등록
     @staticmethod
     def register_seeds(dbc_path: str, db_path: str = "seeds.db") -> int:
-        parser = DbcParser(dbc_path)
-        parsed = parser.parse()
+        parsed = DbcParser(dbc_path).parse()
+        seeds = build_initial_seeds_from_parsed_dbc(parsed)
 
         manager = SeedManager(db_path)
-        seed_groups = manager.from_dbc(parsed)
         queue = SeedQueue(db_path)
-
         total = 0
-        for group in seed_groups:
-            queue.push_group(group)
-            total += len(group)
+        try:
+            for seed in seeds:
+                seed_id = manager.insert_seed(seed)
+                if seed_id is None:
+                    continue
+                queue.push(seed_id)
+                total += 1
+        finally:
+            queue.close()
+            manager.close()
 
-        queue.close()
-        manager.close()
         return total
 
-    
-    # 시드 목록
     @staticmethod
-    def list_seeds(db_path: str = "seeds.db"):
+    def list_seeds(db_path: str = "seeds.db") -> List[Seed]:
         manager = SeedManager(db_path)
-        seeds = manager.get_all()
-        manager.close()
-        return seeds
+        try:
+            return manager.get_all()
+        finally:
+            manager.close()
 
-
-    # config
     def __init__(self, cfg: Dict[str, Any], can_iface: Optional[object] = None):
-        """
-        cfg: config dict (default.yaml 또는 사용자 config)
-        """
-
         self.cfg = cfg
         self.can = can_iface
         self.running = False
 
-        # 시드 큐 초기화
-        seed_db_path = cfg["paths"]["seed_db"]
-        self.queue = SeedQueue(seed_db_path)
+        self.db_path = cfg["paths"]["seed_db"]
+        self.dbc_path = cfg["paths"]["dbc"]
+        self.artifacts_root = cfg.get("paths", {}).get("artifacts", "artifacts")
 
-        # 모니터 매니저
-        self.monitor_manager = MonitorManager(
-            timing_monitor=TimingMonitor(),
+        self.seed_manager = SeedManager(self.db_path)
+        self.queue = SeedQueue(self.db_path)
+        self.tx_log = TxLog(self.seed_manager)
+        self.storage = ReproStorage(self.artifacts_root)
+        self.mutation_engine = MutationEngine(self.seed_manager)
+
+        self.parsed_dbc = DbcParser(self.dbc_path).parse()
+
+        fuzz_cfg = cfg.get("fuzz", {})
+        self.repro_trials = int(fuzz_cfg.get("repro_trials", 5))
+        self.restore_pre = int(fuzz_cfg.get("restore_pre_frames", 5))
+        self.restore_post = int(fuzz_cfg.get("restore_post_frames", 2))
+        self.inter_frame_delay = float(fuzz_cfg.get("inter_frame_delay", 0.01))
+        self.seed_interval = float(fuzz_cfg.get("seed_interval", 0.05))
+        self.monitor_grace = float(fuzz_cfg.get("monitor_grace", 0.5))
+
+    def close(self) -> None:
+        self.queue.close()
+        self.seed_manager.close()
+
+    def stop(self) -> None:
+        self.running = False
+
+    def _target_arb_id(self, seed: Seed) -> int:
+        if self.cfg["can"].get("force_default_id", False):
+            return int(self.cfg["can"]["default_id"], 16)
+        if seed.arb_id is not None:
+            return int(seed.arb_id)
+        return int(seed.message_id)
+
+    def _build_dbc_rules(self, arb_id: int) -> Dict[str, Dict[str, Any]]:
+        for msg in self.parsed_dbc.get("messages", []):
+            if int(msg.get("id")) != int(arb_id):
+                continue
+
+            rules: Dict[str, Dict[str, Any]] = {}
+            for sig in msg.get("signals", []):
+                factor = sig.get("factor", 1)
+                offset = sig.get("offset", 0)
+                length = sig.get("length")
+                minimum = sig.get("minimum")
+                maximum = sig.get("maximum")
+                choices = sig.get("choices") or {}
+
+                if length == 1:
+                    kind = "bool"
+                    enum_vals = [0, 1]
+                    coerce_int = True
+                elif factor not in (None, 0, 1):
+                    kind = "float"
+                    enum_vals = list(choices.keys()) if isinstance(choices, dict) else None
+                    coerce_int = False
+                else:
+                    kind = "int"
+                    enum_vals = list(choices.keys()) if isinstance(choices, dict) else None
+                    coerce_int = True
+
+                rules[sig["name"]] = {
+                    "kind": kind,
+                    "enum": enum_vals,
+                    "min": minimum,
+                    "max": maximum,
+                    "factor": factor if factor not in (None, 0) else 1,
+                    "offset": offset if offset is not None else 0,
+                    "monotonic": None,
+                    "coerce_int": coerce_int,
+                }
+
+            return rules
+
+        return {}
+
+    def _build_monitor_manager(self, arb_id: int) -> MonitorManager:
+        return MonitorManager(
+            timing_monitor=TimingMonitor(
+                channel=self.cfg["can"]["channel"],
+                target_id=arb_id,
+            ),
             uds_monitor=UDSMonitor(),
             dbc_monitor=DBCMonitor(
-                channel=cfg["can"]["channel"],
-                dbc_path=cfg["paths"]["dbc"],
-                target_id=int(cfg["can"]["default_id"], 16),
-                seed_db_path=cfg["paths"]["seed_db"]
-            )
+                channel=self.cfg["can"]["channel"],
+                dbc_path=self.dbc_path,
+                target_id=arb_id,
+                seed_db_path=self.db_path,
+                rules=self._build_dbc_rules(arb_id),
+            ),
         )
 
+    def _collect_monitor_results(self, arb_id: int) -> Dict[str, Dict[str, Any]]:
+        timing_timeout = float(self.cfg["fuzz"].get("timing_timeout", 5.0))
+        dbc_timeout = float(self.cfg["fuzz"].get("dbc_timeout", 5.0))
+        wait_timeout = max(timing_timeout, dbc_timeout) + self.monitor_grace
 
-    # CAN 송신
-    def send_raw_payload(self, data: bytes, arb_id: int):
-        """실제 CAN raw 송신 또는 스텁 출력"""
-        if not self.can:
-            print(f"[Stub:Tx] ID={hex(arb_id)} | Data={data.hex()}")
+        manager = self._build_monitor_manager(arb_id)
+        manager.start_monitors(
+            timing_timeout=timing_timeout,
+            dbc_timeout=dbc_timeout,
+        )
+        manager.wait_for_completion(timeout=wait_timeout)
+
+        scores = manager.get_scores()
+        completed = manager.get_completion_status()
+        status = manager.get_status()
+
+        return {
+            name: {
+                "score": float(scores.get(name, 0.0)),
+                "completed": bool(completed.get(name, False)),
+                "status": str(status.get(name, "unknown")).lower(),
+            }
+            for name in MONITOR_NAMES
+        }
+
+    def _save_monitor_result(self, seed_id: int, monitor_result: Dict[str, Any]) -> None:
+        seed = self.seed_manager.get_seed(seed_id)
+        if seed is None:
             return
 
-        try:
-            self.can.send_raw(data, arb_id=arb_id)
-        except Exception as e:
-            print(f"[!] CAN send error: {e}")
+        meta = dict(seed.meta or {})
+        meta["monitor_result"] = monitor_result
 
-    
-    # 시드
-    def fuzz_seed(self, seed: Seed, monitor_weights: Dict[str, float]):
-        """
-        1. seed → base bytes 생성
-        2. Mutator 생성 & mutate_manager 실행
-        3. Mutated payload 각각 CAN 송신
-        """
+        self.seed_manager.conn.execute(
+            """
+            UPDATE seeds
+            SET meta_json = ?, updated_at = datetime('now')
+            WHERE id = ?
+            """,
+            (json.dumps(meta, ensure_ascii=False), seed_id),
+        )
+        self.seed_manager.conn.commit()
 
-        try:
-            value = int(seed.metadata.offset or 0)
-            base_data = value.to_bytes(8, "little", signed=True)
-        except Exception:
-            base_data = (0).to_bytes(8, "little")
+    def _send_raw_payload(self, payload: bytes, arb_id: int, is_extended: bool = False) -> None:
+        if self.can is None:
+            print(f"[Stub:Tx] ID={hex(arb_id)} | Data={payload.hex()}")
+            return
+        self.can.send_raw(payload, arb_id=arb_id, is_extended=is_extended)
 
-        mut = Mutator(
-            data=base_data,
-            weights=monitor_weights,
-            min_length=1
+    def _send_one(self, seed: Seed) -> int:
+        arb_id = self._target_arb_id(seed)
+        payload = bytes(seed.payload or b"\x00" * int(seed.dlc or 8))
+        dlc = int(seed.dlc or len(payload) or 8)
+
+        self._send_raw_payload(payload, arb_id, bool(seed.is_extended))
+
+        send_idx = self.tx_log.append(
+            TxFrame(
+                arb_id=arb_id,
+                payload=payload,
+                dlc=dlc,
+            ),
+            seed_id=seed.id,
         )
 
-        mutated_list = mut.mutate_manager()
+        self.seed_manager.set_last_send_idx(int(seed.id), send_idx)
+        self.seed_manager.update_status(int(seed.id), "sent")
+        return send_idx
 
-        if self.cfg["can"].get("force_default_id", False):
-            arb_id = int(self.cfg["can"]["default_id"], 16)
-        else:
-            arb_id = seed.message_id or int(self.cfg["can"]["default_id"], 16)
+    def _is_fail(self, monitor_result: Dict[str, Dict[str, Any]]) -> bool:
+        for result in monitor_result.values():
+            if float(result.get("score", 0.0)) > 0.0:
+                return True
+            if str(result.get("status", "ok")).lower() in FAIL_STATUSES:
+                return True
+        return False
 
-        for payload in mutated_list:
-            self.send_raw_payload(payload, arb_id)
-            time.sleep(0.01)
+    def _snapshot_from_seed(self, seed: Seed) -> CandidateSnapshot:
+        monitor_json = (seed.meta or {}).get("monitor_result")
+        return CandidateSnapshot(
+            id=int(seed.id),
+            arb_id=self._target_arb_id(seed),
+            payload=bytes(seed.payload or b""),
+            dlc=int(seed.dlc or len(seed.payload or b"")),
+            priority=seed.priority,
+            parent_id=seed.parent_id,
+            root_id=seed.root_id,
+            depth=seed.depth,
+            monitor_json=monitor_json,
+            repro_verdict=seed.repro_verdict,
+            repro_rate=seed.repro_rate,
+            last_evidence=seed.last_evidence,
+            repro_json=seed.repro_json,
+            last_send_idx=seed.last_send_idx,
+            fingerprint=seed.fingerprint,
+        )
 
+    def _restore_frames(self, snap: CandidateSnapshot) -> List[TxFrame]:
+        if snap.last_send_idx is None:
+            return [
+                TxFrame(
+                    arb_id=snap.arb_id,
+                    payload=snap.payload,
+                    dlc=snap.dlc,
+                )
+            ]
 
-    # 실행
-    def run(self) -> Dict[str, Any]:
-        """
-        0. config 기반 timeout 읽기
-        1. 모니터 시작
-        2. Seed pop → fuzz → Tx
-        3. 모니터 종료
-        4. 점수/상태 반환
-        """
+        frames = self.tx_log.get_window(
+            anchor_send_idx=int(snap.last_send_idx),
+            pre=self.restore_pre,
+            post=self.restore_post,
+        )
+        if frames:
+            return frames
 
+        return [
+            TxFrame(
+                arb_id=snap.arb_id,
+                payload=snap.payload,
+                dlc=snap.dlc,
+            )
+        ]
+
+    def _run_reproduction(self, snap: CandidateSnapshot, n: int) -> List[Dict[str, Any]]:
+        frames = self._restore_frames(snap)
+        trial_results: List[Dict[str, Any]] = []
+
+        for trial_idx in range(1, max(1, n) + 1):
+            for frame in frames:
+                self._send_raw_payload(frame.payload, frame.arb_id, False)
+                time.sleep(self.inter_frame_delay)
+
+            result = self._collect_monitor_results(snap.arb_id)
+            result["trial"] = trial_idx
+            trial_results.append(result)
+
+        return trial_results
+
+    def _mutation_weights(self) -> Dict[str, float]:
+        mutation_cfg = dict(self.cfg.get("mutation", {}))
+        mutation_cfg.setdefault(
+            "manager.budget",
+            self.cfg.get("fuzz", {}).get("child_budget", 16),
+        )
+        mutation_cfg.setdefault("manager.max_ops", 3)
+        return mutation_cfg
+
+    def run(self, max_seeds: Optional[int] = None) -> Dict[str, Any]:
         self.running = True
-
-        timing_timeout = float(self.cfg["fuzz"]["timing_timeout"])
-        dbc_timeout = float(self.cfg["fuzz"]["dbc_timeout"])
-
-        # 1. 모니터 시작
-        self.monitor_manager.start_monitors(
-            timing_timeout=timing_timeout,
-            dbc_timeout=dbc_timeout
-        )
-
-        # 2. CAN Listener 시작
-        if self.can:
-            try:
-                self.can.start_listener()
-            except Exception as e:
-                print(f"[!] CAN listener start failed: {e}")
-
-        monitor_weights = {}  # Mutator 가중치 (추후 확장)
-
-        # 3. fuzz loop
-        while self.running:
-            seed = self.queue.pop()
-            if not seed:
-                break
-
-            self.fuzz_seed(seed, monitor_weights)
-            time.sleep(0.2)
-
-        # 4. CAN listener 종료
-        if self.can:
-            self.can.stop_listener()
-
-        # 5. monitor 종료 대기
-        self.monitor_manager.wait_for_completion()
-
-        scores = self.monitor_manager.get_scores()
-        completed = self.monitor_manager.get_completion_status()
-        status = self.monitor_manager.get_status()
-
-        self.queue.close()
-
-        # 6. 결과 리턴
-        return {
-            "timing": {
-                "score": scores["timing"],
-                "completed": completed["timing"],
-                "status": status["timing"],
-            },
-            "uds": {
-                "score": scores["uds"],
-                "completed": completed["uds"],
-                "status": status["uds"],
-            },
-            "dbc": {
-                "score": scores["dbc"],
-                "completed": completed["dbc"],
-                "status": status["dbc"],
-            },
+        processed = 0
+        findings: List[Dict[str, Any]] = []
+        last_result = {
+            name: {"score": 0.0, "completed": False, "status": "skipped"}
+            for name in MONITOR_NAMES
         }
+
+        try:
+            while self.running:
+                if max_seeds is not None and processed >= max_seeds:
+                    break
+
+                seed_id = self.queue.pop()
+                if seed_id is None:
+                    break
+
+                seed = self.seed_manager.get_seed(int(seed_id))
+                if seed is None or seed.id is None:
+                    continue
+
+                send_idx = self._send_one(seed)
+                time.sleep(self.seed_interval)
+
+                arb_id = self._target_arb_id(seed)
+                monitor_result = self._collect_monitor_results(arb_id)
+                self._save_monitor_result(seed.id, monitor_result)
+
+                processed += 1
+                last_result = monitor_result
+
+                if not self._is_fail(monitor_result):
+                    self.seed_manager.update_status(seed.id, "ok")
+                    continue
+
+                reloaded = self.seed_manager.get_seed(seed.id)
+                if reloaded is None:
+                    continue
+
+                snap = self._snapshot_from_seed(reloaded)
+                snap.last_send_idx = send_idx
+                self.storage.save_candidate(seed.id, snap)
+
+                trial_results = self._run_reproduction(snap, self.repro_trials)
+                frame = ResultFrame.from_trial_results(seed.id, trial_results)
+
+                fusion = EvidenceFusion(
+                    mode=self.cfg.get("fuzz", {}).get("fusion_mode", "binary")
+                ).evaluate(frame)
+
+                self.seed_manager.save_repro_summary(
+                    seed.id,
+                    fusion.verdict,
+                    fusion.repro_rate,
+                    last_evidence=json.dumps(fusion.detail, ensure_ascii=False),
+                )
+                self.seed_manager.save_repro_report(seed.id, frame.to_dict())
+                self.storage.save_report(seed.id, frame.to_dict())
+
+                confirmed = fusion.verdict in {SOFT_FAIL, HARD_FAIL}
+                if confirmed:
+                    self.seed_manager.update_status(seed.id, "confirmed_fail")
+                    child_ids = self.mutation_engine.mutate_and_store_children(
+                        reloaded,
+                        weights=self._mutation_weights(),
+                        min_length=max(1, int(reloaded.dlc or len(reloaded.payload or b""))),
+                        priority_delta=0,
+                        extra_meta={
+                            "mutation_parent": reloaded.id,
+                            "source": "confirmed_fail",
+                        },
+                    )
+                    for child_id in child_ids:
+                        self.queue.push(child_id)
+                else:
+                    self.seed_manager.update_status(seed.id, "reproduced_pass")
+                    child_ids = []
+
+                findings.append(
+                    {
+                        "seed_id": seed.id,
+                        "arb_id": arb_id,
+                        "last_send_idx": send_idx,
+                        "monitor_result": monitor_result,
+                        "reproduction": frame.to_dict(),
+                        "fusion": {
+                            "verdict": fusion.verdict,
+                            "fusion_score": fusion.fusion_score,
+                            "repro_rate": fusion.repro_rate,
+                            "detail": fusion.detail,
+                        },
+                        "confirmed": confirmed,
+                        "child_ids": child_ids,
+                    }
+                )
+
+            return {
+                "processed": processed,
+                "remaining_queue": len(self.queue.queue),
+                "last_result": last_result,
+                "findings": findings,
+            }
+        finally:
+            self.running = False
+            self.close()
