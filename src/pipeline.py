@@ -249,38 +249,30 @@ class AutoFuzzPipeline:
         )
 
     def _restore_frames(self, snap: CandidateSnapshot) -> List[TxFrame]:
-        if snap.last_send_idx is None:
-            return [
-                TxFrame(
-                    arb_id=snap.arb_id,
-                    payload=snap.payload,
-                    dlc=snap.dlc,
-                )
-            ]
-
-        frames = self.tx_log.get_window(
-            anchor_send_idx=int(snap.last_send_idx),
-            pre=self.restore_pre,
-            post=self.restore_post,
-        )
-        if frames:
-            return frames
-
         return [
             TxFrame(
                 arb_id=snap.arb_id,
-                payload=snap.payload,
-                dlc=snap.dlc,
+                payload=bytes(snap.payload or b"\x00" * max(1, int(snap.dlc or 8))),
+                dlc=int(snap.dlc or len(snap.payload or b"") or 8),
             )
         ]
 
-    def _run_reproduction(self, snap: CandidateSnapshot, n: int) -> List[Dict[str, Any]]:
+    def _run_reproduction(
+        self,
+        snap: CandidateSnapshot,
+        n: int,
+        is_extended: bool = False,
+    ) -> List[Dict[str, Any]]:
         frames = self._restore_frames(snap)
         trial_results: List[Dict[str, Any]] = []
 
         for trial_idx in range(1, max(1, n) + 1):
             for frame in frames:
-                self._send_raw_payload(frame.payload, frame.arb_id, False)
+                self._send_raw_payload(
+                    frame.payload,
+                    frame.arb_id,
+                    is_extended=is_extended,
+                )
                 time.sleep(self.inter_frame_delay)
 
             result = self._collect_monitor_results(snap.arb_id)
@@ -342,7 +334,11 @@ class AutoFuzzPipeline:
                 snap.last_send_idx = send_idx
                 self.storage.save_candidate(seed.id, snap)
 
-                trial_results = self._run_reproduction(snap, self.repro_trials)
+                trial_results = self._run_reproduction(
+                    snap,
+                    self.repro_trials,
+                    is_extended=bool(reloaded.is_extended),
+                )
                 frame = ResultFrame.from_trial_results(seed.id, trial_results)
 
                 fusion = EvidenceFusion(
