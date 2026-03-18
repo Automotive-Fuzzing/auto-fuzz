@@ -9,7 +9,7 @@ from ..logger.base_logger import log_event
 # 모니터링 설정값
 
 CAN_CHANNEL = "can0"
-TARGET_UDS_ID = 0x6A6
+TARGET_UDS_ID = 0x70E
 UDS_RESPONSE_OFFSET = 0x6A
 PADDING_BYTE = 0xAA
 
@@ -58,7 +58,7 @@ def load_nrc_fail_list(path: str):
 # UDS 모니터 클래스
 
 class UDSMonitor:
-    def __init__(self, nrc_cfg_path: str = "config/nrc_fail_list.yaml"):
+    def __init__(self, nrc_cfg_path: str = "config/nrc_weights.yaml"):
         self.NRC_FAIL_SET = load_nrc_fail_list(nrc_cfg_path)
 
         self.bus = can.interface.Bus(channel=CAN_CHANNEL, bustype="socketcan")
@@ -108,7 +108,7 @@ class UDSMonitor:
         try:
             # 0x10 세션 진입
             print("[INFO] UDS Monitor - Checking session entry (0x10)...")
-            if not self._send_once_or_retry([0x10, 0x02], "session_entry"):
+            if not self._send_once_or_retry([0x10, 0x01], "session_entry"):
                 print("[FAIL] UDS Monitor - Session entry failed")
                 log_event("uds", TARGET_UDS_ID, "monitor_result", "session_entry_fail", "FAIL")
                 self._fail_score = SCORE_FAIL
@@ -124,7 +124,7 @@ class UDSMonitor:
 
             # 0x19 DTC 읽기
             print("[INFO] UDS Monitor - Reading DTC (0x19)...")
-            self.send_request([0x19, 0x02])
+            self.send_request([0x19, 0x02, 0x20])
             total_dtc, dtc_failed = self.collect_all_dtc()
             
           
