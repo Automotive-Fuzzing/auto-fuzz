@@ -99,6 +99,7 @@ class AutoFuzzPipeline:
                 continue
 
             rules: Dict[str, Dict[str, Any]] = {}
+
             for sig in msg.get("signals", []):
                 factor = sig.get("factor", 1)
                 offset = sig.get("offset", 0)
@@ -113,12 +114,21 @@ class AutoFuzzPipeline:
                     coerce_int = True
                 elif factor not in (None, 0, 1):
                     kind = "float"
-                    enum_vals = list(choices.keys()) if isinstance(choices, dict) else None
+                    enum_vals = None
                     coerce_int = False
                 else:
                     kind = "int"
                     enum_vals = list(choices.keys()) if isinstance(choices, dict) else None
                     coerce_int = True
+
+                # enum이 너무 희소하고 실제 연속값 신호처럼 보이면 enum 검사 비활성화
+                if (
+                    enum_vals is not None
+                    and len(enum_vals) <= 3
+                    and kind in ("int", "float")
+                    and length not in (1, None)
+                ):
+                    enum_vals = None
 
                 rules[sig["name"]] = {
                     "kind": kind,
@@ -166,15 +176,23 @@ class AutoFuzzPipeline:
         scores = manager.get_scores()
         completed = manager.get_completion_status()
         status = manager.get_status()
+        anomalies = manager.get_anomalies()
+        details = manager.get_details()
 
-        return {
-            name: {
-                "score": float(scores.get(name, 0.0)),
+        out: Dict[str, Dict[str, Any]] = {}
+        for name in MONITOR_NAMES:
+            detail = details.get(name, {})
+            out[name] = {
+                "score": float(scores.get(name, detail.get("score", 0.0))),
                 "completed": bool(completed.get(name, False)),
-                "status": str(status.get(name, "unknown")).lower(),
+                "status": str(status.get(name, detail.get("status", "unknown"))).lower(),
+                "is_anomalous": bool(anomalies.get(name, detail.get("is_anomalous", False))),
             }
-            for name in MONITOR_NAMES
-        }
+
+            if "summary" in detail:
+                out[name]["summary"] = detail["summary"]
+
+        return out
 
     def _save_monitor_result(self, seed_id: int, monitor_result: Dict[str, Any]) -> None:
         seed = self.seed_manager.get_seed(seed_id)
@@ -222,10 +240,17 @@ class AutoFuzzPipeline:
 
     def _is_fail(self, monitor_result: Dict[str, Dict[str, Any]]) -> bool:
         for result in monitor_result.values():
-            if float(result.get("score", 0.0)) > 0.0:
+            status = str(result.get("status", "ok")).lower()
+            if status in FAIL_STATUSES:
                 return True
-            if str(result.get("status", "ok")).lower() in FAIL_STATUSES:
-                return True
+
+            if "is_anomalous" in result:
+                if bool(result.get("is_anomalous", False)):
+                    return True
+            else:
+                if float(result.get("score", 0.0)) > 0.0:
+                    return True
+
         return False
 
     def _snapshot_from_seed(self, seed: Seed) -> CandidateSnapshot:

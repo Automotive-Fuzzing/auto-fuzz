@@ -3,7 +3,7 @@
 import can
 import time
 from ..logger.base_logger import log_event
-from typing import Optional
+from typing import Optional, Dict, Any
 
 
 CAN_CHANNEL = "can0"
@@ -19,11 +19,15 @@ class TimingMonitor:
                  channel: str = CAN_CHANNEL,
                  target_id: int = TARGET_ID,
                  expected_cycle: int = EXPECTED_CYCLE_MS,
-                 tolerance: int = TOLERANCE_MS):
+                 tolerance: int = TOLERANCE_MS,
+                 anomaly_threshold: float = 0.3,
+                 min_fail_count: int = 2):
         self.channel = channel
         self.target_id = target_id
         self.expected = expected_cycle
         self.tolerance = tolerance
+        self.anomaly_threshold = anomaly_threshold
+        self.min_fail_count = min_fail_count
 
         self.bus = can.interface.Bus(channel=self.channel, bustype="socketcan")
 
@@ -33,10 +37,11 @@ class TimingMonitor:
         self._cycle_list = []
         self._fail_score = 0.0
         self._total_frames = 0
-
-        # 추가
-        self._warmup_frames = 1          # 첫 프레임 간격은 평가하지 않음
+        self._fail_count = 0
         self._ignored_burst_count = 0
+
+        self._status = "idle"
+        self._is_anomalous = False
 
     def start(self, timeout: Optional[float] = None) -> float:
         print(f"[ INFO ] Monitoring 0x{self.target_id:X} "
@@ -45,18 +50,23 @@ class TimingMonitor:
         if timeout:
             print(f"[ INFO ] Timeout set to {timeout} seconds")
 
-        start_time = time.time()
+        monitor_timeout = timeout or MAX_TIMEOUT
+        start_time = time.monotonic()
+
         self._fail_score = 0.0
         self._total_frames = 0
+        self._fail_count = 0
         self._frame_counter = 0
         self._cycle_list.clear()
         self.prev_time = None
         self._ignored_burst_count = 0
+        self._status = "running"
+        self._is_anomalous = False
 
         try:
             while True:
-                if timeout and (time.time() - start_time) >= timeout:
-                    print(f"[ INFO ] Timing Monitor timeout reached ({timeout}s)")
+                if (time.monotonic() - start_time) >= monitor_timeout:
+                    print(f"[ INFO ] Timing Monitor timeout reached ({monitor_timeout}s)")
                     break
 
                 msg = self.bus.recv(timeout=1.0)
@@ -66,7 +76,6 @@ class TimingMonitor:
                 if msg.arbitration_id != self.target_id:
                     continue
 
-                # 가능하면 CAN 프레임의 timestamp 사용
                 now = (msg.timestamp * 1000.0) if getattr(msg, "timestamp", None) else (time.time() * 1000.0)
 
                 if self.prev_time is None:
@@ -76,8 +85,6 @@ class TimingMonitor:
                 cycle = now - self.prev_time
                 self.prev_time = now
 
-                # 너무 짧은 간격은 버스트/중복 수신 가능성이 높으니 평가 제외
-                # 500ms 기준이면 250ms 미만은 timing anomaly가 아니라 큐/버퍼/중복일 가능성이 큼
                 if cycle < (self.expected * 0.5):
                     self._ignored_burst_count += 1
                     print(f"[SKIP] Burst cycle ignored: {cycle:.2f} ms")
@@ -93,6 +100,7 @@ class TimingMonitor:
                     else:
                         error = cycle - upper
                     self._fail_score += error
+                    self._fail_count += 1
 
                 self._total_frames += 1
 
@@ -120,12 +128,25 @@ class TimingMonitor:
             except Exception:
                 pass
 
-        normalized_score = self._normalize_fail_score(timeout or MAX_TIMEOUT)
+        normalized_score = self._normalize_fail_score(monitor_timeout)
+
+        if self._total_frames == 0:
+            self._status = "timeout"
+            self._is_anomalous = False
+        else:
+            self._status = "ok"
+            self._is_anomalous = (
+                self._fail_count >= self.min_fail_count
+                or normalized_score >= self.anomaly_threshold
+            )
+
         print(f"[ INFO ] Timing Monitor finished")
         print(f"    └ Total FAIL score: {self._fail_score:.2f} ms")
         print(f"    └ Total frames: {self._total_frames}")
+        print(f"    └ Fail count: {self._fail_count}")
         print(f"    └ Ignored burst frames: {self._ignored_burst_count}")
         print(f"    └ Normalized score (0~1): {normalized_score:.4f}")
+        print(f"    └ Status: {self._status}, anomalous={self._is_anomalous}")
 
         return normalized_score
 
@@ -133,7 +154,6 @@ class TimingMonitor:
         if self._total_frames == 0:
             return 0.0
 
-        # 5초 / 500ms = 약 10프레임
         max_possible_frames = max((timeout * 1000.0) / self.expected, 1.0)
         worst_case_score = max_possible_frames * self.tolerance
         normalized = min(self._fail_score / worst_case_score, 1.0)
@@ -144,6 +164,23 @@ class TimingMonitor:
 
     def get_raw_fail_score(self) -> float:
         return self._fail_score
+
+    def get_status(self) -> str:
+        return self._status
+
+    def is_anomalous(self) -> bool:
+        return self._is_anomalous
+
+    def get_summary(self) -> Dict[str, Any]:
+        return {
+            "status": self._status,
+            "score": self._normalize_fail_score(MAX_TIMEOUT),
+            "is_anomalous": self._is_anomalous,
+            "total_frames": self._total_frames,
+            "fail_count": self._fail_count,
+            "ignored_burst_count": self._ignored_burst_count,
+            "raw_fail_score": self._fail_score,
+        }
 
     def fetch_events(self):
         events_copy = self.events[:]

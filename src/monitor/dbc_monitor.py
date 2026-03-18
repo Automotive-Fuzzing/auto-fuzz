@@ -11,6 +11,14 @@ Number = Union[int, float]
 
 
 class DBCMonitor:
+    DEFAULT_WEIGHTS: Dict[str, float] = {
+        "decode_error": 3.0,
+        "missing_signal": 2.5,
+        "type_cast": 2.0,
+        "enum": 1.5,
+        "range": 1.0,
+    }
+
     def _infer_rules_from_seeds(self, seeds, target_id):
         rules: Dict[str, Dict[str, Any]] = {}
 
@@ -25,13 +33,12 @@ class DBCMonitor:
                     return meta.get(key, default)
                 return getattr(meta, key, default)
 
-            length  = m("length")
-            factor  = m("factor", 1)
-            offset  = m("offset", 0)
+            length = m("length")
+            factor = m("factor", 1)
+            offset = m("offset", 0)
             minimum = m("minimum")
             maximum = m("maximum")
-            enum    = m("enum")
-            mono    = m("monotonic")
+            enum = m("enum")
 
             if length == 1:
                 kind = "bool"
@@ -48,7 +55,7 @@ class DBCMonitor:
                 default_enum = None
                 default_min, default_max = minimum, maximum
 
-            # enum 값이 지나치게 적고, 실제 연속값 신호일 가능성이 큰 경우 enum 검사 완화
+            # enum 값이 지나치게 적고 실제 연속값 신호일 가능성이 큰 경우 enum 검사 완화
             if enum is not None and len(enum) <= 3 and kind in ("int", "float") and length not in (1, None):
                 relaxed_enum = None
             else:
@@ -61,7 +68,6 @@ class DBCMonitor:
                 "max": default_max,
                 "factor": factor if factor not in (None, 0) else 1,
                 "offset": offset if offset is not None else 0,
-                "monotonic": mono if mono in ("nondecreasing", "nonincreasing") else None,
                 "coerce_int": coerce_int,
             }
 
@@ -74,14 +80,25 @@ class DBCMonitor:
         target_id: int,
         seed_db_path: str,
         rules: Optional[Dict[str, Dict[str, Any]]] = None,
+        anomaly_threshold: float = 0.30,
+        max_frames: int = 3,
+        default_window_sec: float = 0.5,
+        weights: Optional[Dict[str, float]] = None,
     ):
         self.channel = channel
         self.dbc_path = dbc_path
         self.target_id = target_id
         self.rules = rules or {}
 
+        self.anomaly_threshold = anomaly_threshold
+        self.max_frames = max_frames
+        self.default_window_sec = default_window_sec
+        self.weights = dict(self.DEFAULT_WEIGHTS)
+        if weights:
+            self.weights.update(weights)
+
         self.bus = can.interface.Bus(channel=self.channel, bustype="socketcan")
-        self.db  = cantools.database.load_file(self.dbc_path)
+        self.db = cantools.database.load_file(self.dbc_path)
         self.msg_def = self.db.get_message_by_frame_id(self.target_id)
 
         if self.msg_def is None:
@@ -95,83 +112,64 @@ class DBCMonitor:
             if not self.rules:
                 print("[WARN] Seed DB에서 규칙을 찾지 못했습니다. 검증 없이 모니터링을 진행합니다.")
 
-        self._prev_values: Dict[str, Number] = {}
         self.events: List[Dict[str, Any]] = []
-        self._fail_score = 0.0
-        self._fail_count = 0
-        self._total_checks = 0
-        self._consecutive_failures = 0
-        self._max_consecutive_failures = 3   # 3회 연속 이상일 때만 심각한 오류로 간주
 
-    def start(self, timeout: Optional[float] = None) -> float:
+        self._fail_score = 0.0
+        self._status = "idle"
+        self._is_anomalous = False
+
+        self._weighted_fail_sum = 0.0
+        self._weighted_total = 0.0
+        self._critical_failure_count = 0
+        self._observed_frames = 0
+        self._last_reason = None
+
+    def _reset_state(self):
+        self.events.clear()
+        self._fail_score = 0.0
+        self._status = "idle"
+        self._is_anomalous = False
+
+        self._weighted_fail_sum = 0.0
+        self._weighted_total = 0.0
+        self._critical_failure_count = 0
+        self._observed_frames = 0
+        self._last_reason = None
+
+    def start(self, timeout: Optional[float] = None, max_frames: Optional[int] = None) -> float:
+        """
+        기존 호출 호환용.
+        timeout은 이제 '관측창(window)' 의미로 사용하고,
+        max_frames개까지만 target_id 프레임을 평가한다.
+        """
+        window_sec = timeout if timeout is not None else self.default_window_sec
+        frame_limit = max_frames if max_frames is not None else self.max_frames
+
         print(f"[ INFO ] DBCMonitor: 0x{self.target_id:X} on {self.channel}")
         print(f"         DBC={self.dbc_path}, signals={list(self.rules.keys()) or '—'}")
+        print(f"         window={window_sec}s, max_frames={frame_limit}, threshold={self.anomaly_threshold}")
 
-        self._fail_score = 0.0
-        self._fail_count = 0
-        self._total_checks = 0
-        self._consecutive_failures = 0
-        self._prev_values.clear()
+        self._reset_state()
+        self._status = "running"
 
-        start_time = time.time()
+        deadline = time.monotonic() + window_sec
 
         try:
-            while True:
-                if timeout is not None and (time.time() - start_time) >= timeout:
-                    print(f"[INFO] DBC Monitor timeout reached ({timeout}s)")
-                    break
+            while time.monotonic() < deadline and self._observed_frames < frame_limit:
+                remaining = max(0.0, deadline - time.monotonic())
+                recv_timeout = min(0.1, remaining) if remaining > 0 else 0.0
+                msg = self.bus.recv(timeout=recv_timeout)
 
-                msg = self.bus.recv(timeout=3.0)
-                if not msg or msg.arbitration_id != self.target_id:
+                if not msg:
                     continue
 
-                try:
-                    decoded = self.msg_def.decode(
-                        bytes(msg.data),
-                        decode_choices=False,
-                        scaling=True
-                    )
-                except Exception as e:
-                    self._emit("decode_error", "_frame", str(e), "FAIL")
-                    self._fail_count += 1
-                    self._total_checks += 1
-                    self._update_fail_score()
-                    self._consecutive_failures += 1
-                    if self._consecutive_failures >= self._max_consecutive_failures:
-                        print(f"[WARN] DBC decode 연속 실패: {e}")
+                if msg.arbitration_id != self.target_id:
                     continue
 
-                frame_failed = False
+                self._observed_frames += 1
+                self._evaluate_frame(msg)
 
-                for sig, rule in self.rules.items():
-                    if sig not in decoded:
-                        self._emit("missing_signal", sig, None, "FAIL")
-                        self._fail_count += 1
-                        self._total_checks += 1
-                        frame_failed = True
-                        continue
-
-                    raw = decoded[sig]
-
-                    try:
-                        val = self._normalize_value(raw, rule)
-                    except Exception:
-                        self._emit("type_cast", sig, raw, "FAIL")
-                        self._fail_count += 1
-                        self._total_checks += 1
-                        frame_failed = True
-                        continue
-
-                    ok = self._check_rules(sig, val, rule)
-                    if not ok:
-                        frame_failed = True
-
-                if frame_failed:
-                    self._consecutive_failures += 1
-                else:
-                    self._consecutive_failures = 0
-
-                self._update_fail_score()
+            self._finalize_verdict()
 
         finally:
             try:
@@ -179,8 +177,59 @@ class DBCMonitor:
             except Exception:
                 pass
 
-        print(f"[INFO] DBC Monitor finished - FAIL score: {self._fail_score:.3f}")
+        print(
+            f"[INFO] DBC Monitor finished - "
+            f"status={self._status}, frames={self._observed_frames}, "
+            f"score={self._fail_score:.3f}, anomalous={self._is_anomalous}"
+        )
         return self._fail_score
+
+    def _evaluate_frame(self, msg) -> None:
+        try:
+            decoded = self.msg_def.decode(
+                bytes(msg.data),
+                decode_choices=False,
+                scaling=True,
+            )
+        except Exception as e:
+            self._register_failure(
+                metric="decode_error",
+                sig="_frame",
+                value=str(e),
+                weight=self.weights["decode_error"],
+                critical=True,
+            )
+            self._last_reason = f"decode_error: {e}"
+            return
+
+        for sig, rule in self.rules.items():
+            if sig not in decoded:
+                self._register_failure(
+                    metric="missing_signal",
+                    sig=sig,
+                    value=None,
+                    weight=self.weights["missing_signal"],
+                    critical=True,
+                )
+                self._last_reason = f"missing_signal: {sig}"
+                continue
+
+            raw = decoded[sig]
+
+            try:
+                val = self._normalize_value(raw, rule)
+            except Exception:
+                self._register_failure(
+                    metric="type_cast",
+                    sig=sig,
+                    value=raw,
+                    weight=self.weights["type_cast"],
+                    critical=False,
+                )
+                self._last_reason = f"type_cast: {sig}"
+                continue
+
+            self._check_rules(sig, val, rule)
 
     def _normalize_value(self, raw: Any, rule: Dict[str, Any]) -> Number:
         kind = rule.get("kind", "int")
@@ -203,16 +252,22 @@ class DBCMonitor:
 
         enum_vals = rule.get("enum")
         if enum_vals is not None:
-            self._total_checks += 1
+            enum_weight = self.weights["enum"]
             if rule.get("kind") == "float":
                 enum_ok = any(float(val) == float(a) for a in enum_vals)
             else:
                 enum_ok = val in set(int(a) for a in enum_vals)
 
-            self._emit("enum", sig, val, "OK" if enum_ok else "FAIL")
+            self._register_check(
+                metric="enum",
+                sig=sig,
+                value=val,
+                weight=enum_weight,
+                ok=enum_ok,
+            )
             if not enum_ok:
-                self._fail_count += 1
                 ok = False
+                self._last_reason = f"enum_violation: {sig}"
 
         sigmn, sigmx = rule.get("min"), rule.get("max")
         factor = rule.get("factor", 1) or 1
@@ -221,51 +276,76 @@ class DBCMonitor:
         mn = sigmn if sigmn is None else (sigmn - offset) / factor
         mx = sigmx if sigmx is None else (sigmx - offset) / factor
 
+        # range 하한
         if mn is not None:
-            self._total_checks += 1
-            if float(val) < float(mn):
-                self._fail_count += 1
-                self._emit("range", sig, val, "FAIL")
+            range_min_ok = float(val) >= float(mn)
+            self._register_check(
+                metric="range",
+                sig=sig,
+                value={"value": val, "bound": "min", "expected": mn},
+                weight=self.weights["range"],
+                ok=range_min_ok,
+            )
+            if not range_min_ok:
                 ok = False
+                self._last_reason = f"range_min_violation: {sig}"
 
+        # range 상한
         if mx is not None:
-            self._total_checks += 1
-            if float(val) > float(mx):
-                self._fail_count += 1
-                self._emit("range", sig, val, "FAIL")
+            range_max_ok = float(val) <= float(mx)
+            self._register_check(
+                metric="range",
+                sig=sig,
+                value={"value": val, "bound": "max", "expected": mx},
+                weight=self.weights["range"],
+                ok=range_max_ok,
+            )
+            if not range_max_ok:
                 ok = False
+                self._last_reason = f"range_max_violation: {sig}"
 
-        if (mn is not None or mx is not None) and ok:
-            self._emit("range", sig, val, "OK")
-
-        mode = rule.get("monotonic")
-        if mode:
-            prev = self._prev_values.get(sig)
-            if prev is not None:
-                self._total_checks += 1
-                pv = float(prev)
-                cv = float(val)
-
-                if mode == "nondecreasing" and cv < pv:
-                    self._fail_count += 1
-                    self._emit("monotonic", sig, {"prev": prev, "cur": val, "mode": mode}, "FAIL")
-                    ok = False
-
-                elif mode == "nonincreasing" and cv > pv:
-                    self._fail_count += 1
-                    self._emit("monotonic", sig, {"prev": prev, "cur": val, "mode": mode}, "FAIL")
-                    ok = False
-                else:
-                    self._emit("monotonic", sig, {"prev": prev, "cur": val, "mode": mode}, "OK")
-
-        self._prev_values[sig] = val
         return ok
 
-    def _update_fail_score(self):
-        if self._total_checks == 0:
+    def _register_check(self, metric: str, sig: str, value: Any, weight: float, ok: bool) -> None:
+        self._weighted_total += weight
+        if ok:
+            self._emit(metric, sig, value, "OK")
+        else:
+            self._weighted_fail_sum += weight
+            self._emit(metric, sig, value, "FAIL")
+
+    def _register_failure(
+        self,
+        metric: str,
+        sig: str,
+        value: Any,
+        weight: float,
+        critical: bool = False,
+    ) -> None:
+        self._weighted_total += weight
+        self._weighted_fail_sum += weight
+        self._emit(metric, sig, value, "FAIL")
+
+        if critical:
+            self._critical_failure_count += 1
+
+    def _finalize_verdict(self):
+        if self._observed_frames == 0:
+            self._status = "timeout"
             self._fail_score = 0.0
+            self._is_anomalous = False
             return
-        self._fail_score = min(self._fail_count / self._total_checks, 1.0)
+
+        if self._weighted_total <= 0:
+            self._fail_score = 0.0
+        else:
+            self._fail_score = min(self._weighted_fail_sum / self._weighted_total, 1.0)
+
+        self._is_anomalous = (
+            self._critical_failure_count >= 1
+            or self._fail_score >= self.anomaly_threshold
+        )
+        self._status = "ok"
 
     def _emit(self, metric: str, sig: str, value: Any, status: str):
         ev = {
@@ -287,3 +367,21 @@ class DBCMonitor:
 
     def get_fail_score(self) -> float:
         return self._fail_score
+
+    def is_anomalous(self) -> bool:
+        return self._is_anomalous
+
+    def get_status(self) -> str:
+        return self._status
+
+    def get_summary(self) -> Dict[str, Any]:
+        return {
+            "status": self._status,
+            "score": self._fail_score,
+            "is_anomalous": self._is_anomalous,
+            "observed_frames": self._observed_frames,
+            "critical_failure_count": self._critical_failure_count,
+            "weighted_fail_sum": self._weighted_fail_sum,
+            "weighted_total": self._weighted_total,
+            "last_reason": self._last_reason,
+        }
