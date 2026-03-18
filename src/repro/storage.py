@@ -2,37 +2,52 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, is_dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from .candidate import CandidateSnapshot
 
 JsonDict = Dict[str, Any]
 
+
 class StorageIOError(RuntimeError):
     pass
+
 
 class ReproStorage:
     def __init__(self, artifacts_root: Union[str, Path] = "artifacts") -> None:
         self.root = Path(artifacts_root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self.run_dir = self._create_run_dir()
 
-    def _sid(self, seed_id: Union[str, int]) -> str:
-        s = str(seed_id).strip()
-        if not s:
-            raise ValueError("seed_id must be non-empty")
-        return s
+    def _create_run_dir(self) -> Path:
+        date_str = datetime.now().strftime("%Y%m%d")
+        prefix = f"run_{date_str}_"
 
-    def artifact_dir(self, seed_id: Union[str, int]) -> Path:
-        p = self.root / "repro" / self._sid(seed_id)
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        max_n = 0
+        for p in self.root.iterdir():
+            if not p.is_dir():
+                continue
 
-    def candidate_path(self, seed_id: Union[str, int]) -> Path:
-        return self.artifact_dir(seed_id) / "candidate.json"
+            name = p.name
+            if not name.startswith(prefix):
+                continue
 
-    def report_path(self, seed_id: Union[str, int], name: str) -> Path:
-        return self.artifact_dir(seed_id) / name
+            suffix = name[len(prefix):]
+            if suffix.isdigit():
+                max_n = max(max_n, int(suffix))
+
+        run_name = f"{prefix}{max_n + 1:03d}"
+        run_dir = self.root / run_name
+        run_dir.mkdir(parents=True, exist_ok=False)
+        return run_dir
+
+    def candidates_path(self) -> Path:
+        return self.run_dir / "candidates.json"
+
+    def reports_path(self) -> Path:
+        return self.run_dir / "reports.json"
 
     def _dump_json(self, path: Path, obj: Any) -> None:
         try:
@@ -58,32 +73,47 @@ class ReproStorage:
         except Exception as e:
             raise StorageIOError(f"Invalid JSON: {path}") from e
 
+    def _normalize_obj(self, obj: Any) -> Any:
+        try:
+            if is_dataclass(obj):
+                return asdict(obj)
+            return obj
+        except Exception:
+            return {"_raw": str(obj)}
+
+    def _append_json_array(self, path: Path, obj: Any) -> Path:
+        normalized = self._normalize_obj(obj)
+
+        if path.exists():
+            data = self._load_json(path)
+            if not isinstance(data, list):
+                raise StorageIOError(f"Expected JSON array: {path}")
+        else:
+            data = []
+
+        data.append(normalized)
+        self._dump_json(path, data)
+        return path
+
     def save_candidate(self, seed_id: Union[str, int], c: CandidateSnapshot) -> Path:
-        p = self.candidate_path(seed_id)
-        self._dump_json(p, c.to_dict())
-        return p
+        # seed_id는 기존 호출부 호환용으로만 유지
+        return self._append_json_array(self.candidates_path(), c.to_dict())
 
-    def load_candidate(self, seed_id: Union[str, int]) -> CandidateSnapshot:
-        p = self.candidate_path(seed_id)
-        d = self._load_json(p)
-        if not isinstance(d, dict):
-            raise StorageIOError(f"candidate.json must be a JSON object: {p}")
-        return CandidateSnapshot.from_dict(d)
+    def load_candidates(self) -> List[CandidateSnapshot]:
+        p = self.candidates_path()
+        if not p.exists():
+            return []
 
-    def _report_name(self, seed_id: Union[str, int]) -> str:
-        d = self.artifact_dir(seed_id)
-        n = 1
+        data = self._load_json(p)
+        if not isinstance(data, list):
+            raise StorageIOError(f"candidates.json must be a JSON array: {p}")
 
-        for f in d.glob("report_*.json"):
-            stem = f.stem
-            try:
-                suffix = stem.split("_", 1)[1]
-                if suffix.isdigit():
-                    n = max(n, int(suffix) + 1)
-            except (IndexError, ValueError):
-                pass
-
-        return f"report_{n:03d}.json"
+        result: List[CandidateSnapshot] = []
+        for item in data:
+            if not isinstance(item, dict):
+                raise StorageIOError(f"Each candidate entry must be a JSON object: {p}")
+            result.append(CandidateSnapshot.from_dict(item))
+        return result
 
     def save_report(
         self,
@@ -92,33 +122,52 @@ class ReproStorage:
         *,
         name: Optional[str] = None,
     ) -> Path:
-        fname = name or self._report_name(seed_id)
-        p = self.report_path(seed_id, fname)
-        self._dump_json(p, report)
-        return p
+        # seed_id, name은 기존 호출부 호환용으로만 유지
+        return self._append_json_array(self.reports_path(), report)
 
-    def load_report(self, seed_id: Union[str, int], name: str) -> JsonDict:
-        p = self.report_path(seed_id, name)
-        d = self._load_json(p)
-        if not isinstance(d, dict):
-            raise StorageIOError(f"report must be a JSON object: {p}")
-        return d
+    def load_reports(self) -> List[JsonDict]:
+        p = self.reports_path()
+        if not p.exists():
+            return []
+
+        data = self._load_json(p)
+        if not isinstance(data, list):
+            raise StorageIOError(f"reports.json must be a JSON array: {p}")
+
+        result: List[JsonDict] = []
+        for item in data:
+            if not isinstance(item, dict):
+                raise StorageIOError(f"Each report entry must be a JSON object: {p}")
+            result.append(item)
+        return result
+
+
+    def load_candidate(self, seed_id: Union[str, int]) -> CandidateSnapshot:
+        sid = str(seed_id)
+
+        for candidate in self.load_candidates():
+            cid = getattr(candidate, "id", None)
+            rid = getattr(candidate, "root_id", None)
+
+            if str(cid) == sid or str(rid) == sid:
+                return candidate
+
+        raise StorageIOError(f"No candidate found for seed_id={seed_id}")
+
+    def load_report(self, seed_id: Union[str, int], name: str = "") -> JsonDict:
+        sid = str(seed_id)
+
+        for report in reversed(self.load_reports()):
+            if str(report.get("seed_id")) == sid:
+                return report
+
+        raise StorageIOError(f"No report found for seed_id={seed_id}")
 
     def latest_report(self, seed_id: Union[str, int]) -> Optional[Path]:
-        d = self.artifact_dir(seed_id)
-        latest: Optional[Path] = None
-        max_n = 0
+        sid = str(seed_id)
 
-        for f in d.glob("report_*.json"):
-            stem = f.stem
-            try:
-                suffix = stem.split("_", 1)[1]
-                if suffix.isdigit():
-                    n = int(suffix)
-                    if n > max_n:
-                        max_n = n
-                        latest = f
-            except (IndexError, ValueError):
-                pass
+        for report in reversed(self.load_reports()):
+            if str(report.get("seed_id")) == sid:
+                return self.reports_path()
 
-        return latest
+        return None
