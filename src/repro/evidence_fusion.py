@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from .report import ResultFrame, MONITOR_NAMES
 
@@ -24,7 +24,7 @@ class FusionResult:
     verdict: str
     fusion_score: float
     repro_rate: float
-    detail: Dict[str, float]
+    detail: Dict[str, Any]
 
 
 class EvidenceFusion:
@@ -61,9 +61,21 @@ class EvidenceFusion:
             )
 
         self.mode = mode
-        self.soft_threshold = soft_threshold
-        self.hard_threshold = hard_threshold
-        self.weights = weights or dict(_DEFAULT_WEIGHTS)
+        self.soft_threshold = float(soft_threshold)
+        self.hard_threshold = float(hard_threshold)
+        self.weights = dict(_DEFAULT_WEIGHTS)
+        if weights:
+            self.weights.update(weights)
+
+    @classmethod
+    def from_config(cls, cfg: Optional[Dict[str, Any]]) -> "EvidenceFusion":
+        cfg = cfg or {}
+        return cls(
+            mode=cfg.get("fusion_mode", "binary"),
+            soft_threshold=cfg.get("soft_threshold", _DEFAULT_SOFT),
+            hard_threshold=cfg.get("hard_threshold", _DEFAULT_HARD),
+            weights=cfg.get("weights"),
+        )
 
     def evaluate(self, frame: ResultFrame) -> FusionResult:
         if self.mode == "binary":
@@ -99,11 +111,17 @@ class EvidenceFusion:
         return round(self._fail_count(frame, name) / trials, 4)
 
     def _binary(self, frame: ResultFrame) -> FusionResult:
-        rr = frame.reproduction_rate
-        detail = {name: self._anomaly_rate(frame, name) for name in MONITOR_NAMES}
+        rr = round(float(frame.reproduction_rate), 4)
+        detail = {
+            name: {
+                "anomaly_rate": self._anomaly_rate(frame, name),
+                "weight": self.weights.get(name, 0.0),
+            }
+            for name in MONITOR_NAMES
+        }
         return FusionResult(
             verdict=self._verdict(rr),
-            fusion_score=round(rr, 4),
+            fusion_score=rr,
             repro_rate=rr,
             detail=detail,
         )
@@ -113,21 +131,26 @@ class EvidenceFusion:
         if total_w <= 0:
             raise ValueError("weights 합이 0 이하입니다.")
 
-        detail: Dict[str, float] = {}
+        detail: Dict[str, Any] = {}
         score = 0.0
 
         for name in MONITOR_NAMES:
-            w = self.weights.get(name, 0.0)
+            w = float(self.weights.get(name, 0.0))
             anomaly_rate = self._anomaly_rate(frame, name)
             contrib = (w / total_w) * anomaly_rate
-            detail[name] = round(contrib, 4)
+
+            detail[name] = {
+                "weight": round(w, 4),
+                "anomaly_rate": round(anomaly_rate, 4),
+                "contribution": round(contrib, 4),
+            }
             score += contrib
 
         score = round(min(score, 1.0), 4)
         return FusionResult(
             verdict=self._verdict(score),
             fusion_score=score,
-            repro_rate=frame.reproduction_rate,
+            repro_rate=round(float(frame.reproduction_rate), 4),
             detail=detail,
         )
 
@@ -136,20 +159,25 @@ class EvidenceFusion:
         if total_w <= 0:
             raise ValueError("weights 합이 0 이하입니다.")
 
-        detail: Dict[str, float] = {}
+        detail: Dict[str, Any] = {}
         score = 0.0
 
         for name in MONITOR_NAMES:
-            w = self.weights.get(name, 0.0)
+            w = float(self.weights.get(name, 0.0))
             mean_score = self._mean_score(frame, name)
             contrib = (w / total_w) * mean_score
-            detail[name] = round(contrib, 4)
+
+            detail[name] = {
+                "weight": round(w, 4),
+                "mean_score": round(mean_score, 4),
+                "contribution": round(contrib, 4),
+            }
             score += contrib
 
         score = round(min(score, 1.0), 4)
         return FusionResult(
             verdict=self._verdict(score),
             fusion_score=score,
-            repro_rate=frame.reproduction_rate,
+            repro_rate=round(float(frame.reproduction_rate), 4),
             detail=detail,
         )
