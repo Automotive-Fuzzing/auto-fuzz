@@ -237,7 +237,7 @@ class UDSMonitor:
         log_event("uds", self.target_uds_id, "monitor_result", reason, "FAIL")
         self._fail_score = self.score_fail
         self._is_anomalous = True
-        self._status = "ok"
+        self._status = "failed"
         self._last_reason = reason
 
     def _send_once_or_retry(self, data, step_name):
