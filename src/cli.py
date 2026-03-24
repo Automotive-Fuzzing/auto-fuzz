@@ -83,9 +83,13 @@ def cli() -> None:
 @click.option("--db", default=None, help="seed DB path override")
 def register_cmd(config: Optional[str], dbc: Optional[str], db: Optional[str]) -> None:
     cfg = _load_cfg(config, dbc, db)
+    init_cfg = cfg.get("initial_mutation", {})
     count = AutoFuzzPipeline.register_seeds(
         dbc_path=cfg["paths"]["dbc"],
         db_path=cfg["paths"]["seed_db"],
+        enable_initial_mutation=bool(init_cfg.get("enable", True)),
+        initial_budget=int(init_cfg.get("budget", 2)),
+        initial_max_ops=int(init_cfg.get("max_ops", 1)),
     )
     click.echo(click.style(f"[✓] Seed 등록 완료: 총 {count}개", fg="green"))
 
