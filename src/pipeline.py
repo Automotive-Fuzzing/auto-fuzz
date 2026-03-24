@@ -10,6 +10,7 @@ from .monitor.dbc_monitor import DBCMonitor
 from .monitor.monitor_manager import MonitorManager
 from .monitor.timing_monitor import TimingMonitor
 from .monitor.uds_monitor import UDSMonitor
+from .mutation.mutator import Mutator
 from .repro.candidate import CandidateSnapshot
 from .repro.evidence_fusion import HARD_FAIL, SOFT_FAIL, EvidenceFusion
 from .repro.report import MONITOR_NAMES, ResultFrame
@@ -26,20 +27,110 @@ FAIL_STATUSES = frozenset({"crashed", "timeout"})
 
 class AutoFuzzPipeline:
     @staticmethod
-    def register_seeds(dbc_path: str, db_path: str = "seeds.db") -> int:
+    def _initial_mutation_weights(
+        initial_budget: int = 2,
+        initial_max_ops: int = 1,
+    ) -> Dict[str, Any]:
+        return {
+            "manager.budget": max(0, int(initial_budget)),
+            "manager.max_ops": max(1, int(initial_max_ops)),
+            "manager.structural": False,
+            "manager.include_original": False,
+        }
+
+    @staticmethod
+    def _generate_initial_mutation_payloads(
+        seed: Seed,
+        initial_budget: int = 2,
+        initial_max_ops: int = 1,
+    ) -> List[bytes]:
+        if initial_budget <= 0:
+            return []
+
+        base_payload = bytes(seed.payload or b"\x00" * max(1, int(seed.dlc or 8)))
+        if not base_payload:
+            return []
+
+        mutator = Mutator(
+            data=base_payload,
+            weights=AutoFuzzPipeline._initial_mutation_weights(
+                initial_budget=initial_budget,
+                initial_max_ops=initial_max_ops,
+            ),
+            min_length=max(1, min(len(base_payload), int(seed.dlc or len(base_payload) or 8))),
+        )
+
+        mutated = mutator.mutate_manager()
+
+        out: List[bytes] = []
+        seen: set[bytes] = set()
+        for payload in mutated:
+            payload = bytes(payload)
+            if payload == base_payload:
+                continue
+            if payload in seen:
+                continue
+            seen.add(payload)
+            out.append(payload)
+
+        return out[: max(0, int(initial_budget))]
+
+    @staticmethod
+    def register_seeds(
+        dbc_path: str,
+        db_path: str = "seeds.db",
+        enable_initial_mutation: bool = True,
+        initial_budget: int = 2,
+        initial_max_ops: int = 1,
+    ) -> int:
         parsed = DbcParser(dbc_path).parse()
         seeds = build_initial_seeds_from_parsed_dbc(parsed)
 
         manager = SeedManager(db_path)
         queue = SeedQueue(db_path)
         total = 0
+
         try:
             for seed in seeds:
-                seed_id = manager.insert_seed(seed)
-                if seed_id is None:
+                root_seed_id = manager.insert_seed(seed)
+                if root_seed_id is None:
                     continue
-                queue.push(seed_id)
+
+                queue.push(root_seed_id)
                 total += 1
+
+                if not enable_initial_mutation:
+                    continue
+
+                root_seed = manager.get_seed(root_seed_id)
+                if root_seed is None:
+                    continue
+
+                initial_payloads = AutoFuzzPipeline._generate_initial_mutation_payloads(
+                    root_seed,
+                    initial_budget=initial_budget,
+                    initial_max_ops=initial_max_ops,
+                )
+
+                for idx, payload in enumerate(initial_payloads, start=1):
+                    child_id = manager.create_child_seed(
+                        parent=root_seed,
+                        payload=payload,
+                        priority_delta=0,
+                        status="queued",
+                        extra_meta={
+                            "source": "initial_mutation",
+                            "initial_mutation": True,
+                            "initial_mutation_order": idx,
+                            "initial_budget": int(initial_budget),
+                            "initial_max_ops": int(initial_max_ops),
+                        },
+                    )
+                    if child_id is None:
+                        continue
+
+                    queue.push(child_id)
+                    total += 1
         finally:
             queue.close()
             manager.close()
@@ -418,7 +509,7 @@ class AutoFuzzPipeline:
 
                 fusion = EvidenceFusion.from_config(
                     self.cfg.get("fusion", {})
-                ).evaluate(frame)   
+                ).evaluate(frame)
 
                 self.seed_manager.save_repro_summary(
                     seed.id,

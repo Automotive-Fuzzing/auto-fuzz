@@ -4,7 +4,6 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from .seed_manager import Seed, SeedManager
-from .factory import build_child_seed
 from ..mutation.mutator import Mutator
 
 class MutationEngine:
@@ -32,15 +31,13 @@ class MutationEngine:
 
         new_ids: List[int] = []
         for p in mutated_payloads:
-            child = build_child_seed(
+            new_id = self.sm.create_child_seed(
                 parent,
                 payload=p,
                 priority_delta=priority_delta,
                 status="queued",
                 extra_meta=extra_meta,
             )
-
-            new_id = self.sm.insert_seed(child)  # dedup이면 None
             if new_id is not None:
                 new_ids.append(int(new_id))
 

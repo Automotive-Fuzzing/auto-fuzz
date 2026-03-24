@@ -13,6 +13,15 @@ fuzz:
   timing_timeout: 5.0
   dbc_timeout: 5.0
 
+  repro_trials: 5
+  child_budget: 16
+
+
+initial_mutation:
+  enable: true
+  budget: 2
+  max_ops: 1
+
 
 # [튜닝 가이드]
 # 1) fail이 거의 안 뜨면: timing.anomaly_threshold ↓ / timing.tolerance_ms ↓ / dbc.anomaly_threshold ↓

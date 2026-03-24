@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
-import hashlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -282,6 +282,61 @@ class SeedManager:
             self.conn.commit()
 
         return new_id
+
+    def clone_child_seed(
+        self,
+        parent: Seed,
+        payload: bytes,
+        *,
+        priority_delta: int = 0,
+        status: str = "queued",
+        extra_meta: Optional[Dict[str, Any]] = None,
+    ) -> Seed:
+        parent.ensure_candidate_defaults()
+        child_payload = bytes(payload)
+        child_meta = dict(parent.meta or {})
+        if extra_meta:
+            child_meta.update(extra_meta)
+
+        child = Seed(
+            message_id=parent.message_id,
+            signal_name=parent.signal_name,
+            desc=parent.desc,
+            priority=int(parent.priority) + int(priority_delta),
+            metadata=parent.metadata,
+            arb_id=parent.arb_id,
+            payload=child_payload,
+            dlc=len(child_payload),
+            is_extended=bool(parent.is_extended),
+            parent_id=parent.id,
+            root_id=parent.root_id if parent.root_id is not None else parent.id,
+            depth=int(parent.depth or 0) + 1,
+            status=status,
+            meta=child_meta,
+        )
+        child.ensure_candidate_defaults()
+        return child
+
+    def create_child_seed(
+        self,
+        parent: Seed,
+        payload: bytes,
+        *,
+        priority_delta: int = 0,
+        status: str = "queued",
+        extra_meta: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        if parent.id is None:
+            return None
+
+        child = self.clone_child_seed(
+            parent=parent,
+            payload=payload,
+            priority_delta=priority_delta,
+            status=status,
+            extra_meta=extra_meta,
+        )
+        return self.insert_seed(child)
 
     def get_all(self) -> List[Seed]:
         rows = self.conn.execute(
