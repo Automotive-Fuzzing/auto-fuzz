@@ -12,3 +12,258 @@ can:
 fuzz:
   timing_timeout: 5.0
   dbc_timeout: 5.0
+
+
+# [튜닝 가이드]
+# 1) fail이 거의 안 뜨면: timing.anomaly_threshold ↓ / timing.tolerance_ms ↓ / dbc.anomaly_threshold ↓
+# 2) fail이 너무 많이 뜨면: timing.tolerance_ms ↑ / dbc.default_window_sec ↑ / dbc.max_frames ↑
+# 3) DBC 프레임이 잘 안 잡히면: dbc.default_window_sec ↑, dbc.max_frames ↑
+# 4) UDS 응답이 자주 끊기면: uds.request_timeout ↑, uds.retry_count ↑
+
+
+# Monitor별 FAIL 판정 조절
+monitor:
+  manager:
+    # 모니터 스레드가 join timeout 안에 끝나지 않았을 때 anomaly로 볼지 여부
+    # - false 권장: thread timeout을 곧바로 fail로 보면 오탐이 많아질 수 있음
+    # - true  설정 시 환경 문제/정지 상태도 공격 후보로 남길 수 있음
+    thread_timeout_as_anomaly: false
+
+    # 모니터 내부 예외(crash) 발생 시 anomaly로 볼지 여부
+    # - true 권장: 모니터가 죽을 정도면 퍼징 관점에서 의미 있는 신호일 가능성이 큼
+    crash_as_anomaly: true
+
+
+  timing:
+    # 기대 주기(ms)
+    # - target ID가 정상적으로 몇 ms 주기로 들어와야 하는지
+    # - 예: 500이면 500ms 주기 프레임을 기대한다는 의미
+    expected_cycle_ms: 500
+
+    # 허용 오차(ms)
+    # - expected_cycle_ms ± tolerance_ms 범위면 정상
+    # - fail이 너무 많이 뜨면 80 -> 100/120으로 올림
+    # - fail이 너무 안 뜨면 80 -> 60 정도로 내릴 수 있음
+    tolerance_ms: 80
+
+    # 정규화 fail 비율 임계값
+    # - (유효 fail 수 / 관측 프레임 수) 가 이 값 이상이면 anomaly
+    # - 값이 낮을수록 민감, 높을수록 둔감
+    # - fail이 너무 안 뜨면 0.25 -> 0.20
+    # - fail이 너무 많으면 0.25 -> 0.30
+    anomaly_threshold: 0.25
+
+    # 최소 fail 횟수
+    # - anomaly로 보기 위한 최소 fail 개수
+    # - 1이면 매우 민감, 2~3이면 조금 안정적
+    min_fail_count: 2
+
+    # 최소 관측 프레임 수
+    # - 이 수보다 적게 관측되면 fail/pass 판단 대신 insufficient_observation 처리
+    # - 너무 낮으면 성급하게 판정
+    # - 너무 높으면 판단 보류가 많아질 수 있음
+    min_observed_frames: 3
+
+    # 첫 번째 fail은 무시할지 여부
+    # - true 권장: 첫 프레임 튐/환경 노이즈를 흡수
+    # - false면 초반 일시적 흔들림도 바로 통계에 반영됨
+    ignore_first_fail: true
+
+    # burst 판정 비율
+    # - cycle < expected_cycle_ms * burst_ratio 이면 너무 빠른 burst성 입력으로 간주
+    # - 예: 500ms * 0.35 = 175ms 미만이면 burst 의심
+    burst_ratio: 0.35
+
+    # 연속 burst가 몇 번 이상이면 강한 이상으로 볼지
+    # - 값이 낮을수록 burst에 민감
+    burst_escalation_count: 3
+
+    # 심각한 편차 판정 배수
+    # - max_deviation >= tolerance_ms * severe_deviation_multiplier 이면 anomaly
+    # - 예: tolerance=80, multiplier=3.0 -> 240ms 이상 이탈 시 강한 이상
+    severe_deviation_multiplier: 3.0
+
+    # raw fail score 임계값
+    # - 편차 누적치(ms) 기반 강제 anomaly 조건
+    # - 정규화 비율이 낮아도 큰 편차가 반복 누적되면 잡기 위한 장치
+    raw_fail_score_threshold: 150.0
+
+    # 프레임을 전혀 못 본 경우 부여할 status
+    # - 보통 timeout 사용
+    # - report/evidence_fusion에서 crashed/timeout은 fail 성격으로 해석 가능
+    no_frame_status: "timeout"
+
+
+  dbc:
+    # DBC 위반 score 임계값
+    # - weighted_fail_sum / weighted_total 값이 이 이상이면 anomaly
+    # - 낮출수록 민감, 높일수록 둔감
+    anomaly_threshold: 0.40
+
+    # 최대 관측 프레임 수
+    # - DBC Monitor가 한 번 실행될 때 몇 개 프레임까지 볼지
+    # - 프레임이 너무 자주 놓치면 5 -> 8 또는 10으로 상향 가능
+    # - 너무 크면 실행 시간이 길어질 수 있음
+    max_frames: 5
+
+    # 최소 관측 프레임 수
+    # - 이 수보다 적게 보면 insufficient_observation 처리
+    min_observed_frames: 2
+
+    # 기본 관측 시간(초)
+    # - 이 시간 동안 target ID 프레임을 수집
+    # - 프레임이 잘 안 잡히면 1.5 -> 2.0~3.0으로 늘릴 수 있음
+    default_window_sec: 1.5
+
+    # target ID 프레임을 하나도 못 봤을 때 anomaly로 볼지
+    # - false 권장: 무조건 fail로 치면 환경 이슈까지 과검출할 수 있음
+    timeout_as_anomaly: false
+
+    # 관측 부족(insufficient_observation)을 anomaly로 볼지
+    # - false 권장: 이 상태는 "이상"이 아니라 "판단 불가"에 가깝기 때문
+    insufficient_observation_as_anomaly: false
+
+    # float enum 비교 허용 오차
+    # - scaling된 float 신호가 enum/choice처럼 처리될 때 미세 오차 허용 범위
+    float_enum_epsilon: 0.0001
+
+    # enum relax 기준 개수
+    # - enum 후보 개수가 너무 적은 신호는 과도한 false positive가 날 수 있어
+    #   작은 enum은 range만 보고 enum 체크는 완화할 때 사용
+    # - 예: 3 이하의 enum은 enum 검사 완화
+    enum_relax_threshold: 3
+
+    # 위반 종류별 가중치
+    # - score = weighted_fail_sum / weighted_total
+    # - 큰 값일수록 해당 위반을 더 심각하게 본다는 의미
+    weights:
+      # DBC 디코딩 자체 실패
+      # - 메시지 포맷 자체가 비정상일 가능성이 높아서 가장 강하게 반영
+      decode_error: 3.0
+
+      # 정의된 signal이 디코딩 결과에 없음
+      # - 구조적 이상 가능성이 커서 높게 반영
+      missing_signal: 2.5
+
+      # 타입 변환 실패
+      # - int/float/bool로 정상 해석이 안 되는 경우
+      type_cast: 2.0
+
+      # enum 값 위반
+      # - 선택지에 없는 값
+      # - 너무 공격적으로 잡히면 1.5 -> 1.0으로 낮출 수 있음
+      enum: 1.5
+
+      # min/max 범위 위반
+      # - 가장 흔한 이상이라 상대적으로 기본 가중치
+      range: 1.0
+
+
+  uds:
+    # UDS 요청을 보낼 CAN 채널
+    # - 일반 CAN 송신 채널과 동일한 경우가 많음
+    can_channel: "can0"
+
+    # UDS 요청 대상 ID
+    # - 보통 ECU physical request ID
+    target_uds_id: 0x70E
+
+    # 응답 ID 계산용 offset
+    # - rxid = target_uds_id + response_offset
+    # - 예: 0x70E + 0x6A = 0x778
+    response_offset: 0x6A
+
+    # ISO-TP padding byte
+    # - 남는 바이트 채울 때 사용
+    padding_byte: 0xAA
+
+    # 단일 요청 응답 대기 시간(초)
+    # - ECU 응답이 느리면 1.0 -> 1.5~2.0으로 상향 가능
+    request_timeout: 1.0
+
+    # 재시도 횟수
+    # - 1이면 최대 2번 시도
+    # - 환경 노이즈가 많으면 늘릴 수 있지만, 너무 크면 속도 저하
+    retry_count: 1
+
+    # 허용 DTC 개수 임계값
+    # - 수집된 DTC가 이 값 초과면 fail
+    # - baseline ECU 상태에 따라 조정 필요
+    dtc_threshold: 10
+
+    # DTC 전체 수집 타임아웃(초)
+    # - 0x19 응답이 여러 프레임으로 올 때 누적 대기 시간
+    dtc_collect_timeout: 2.0
+
+    # DTC 프레임 1회 수신 대기 시간(초)
+    # - collect_all_dtc 내부에서 각 응답 조각을 기다리는 시간
+    dtc_response_timeout: 0.5
+
+    # UDS fail 시 score
+    # - 보통 binary처럼 1.0 사용
+    score_fail: 1.0
+
+    # UDS success 시 score
+    # - 보통 0.0 사용
+    score_success: 0.0
+
+    # UDS monitor 예외(crash)를 anomaly로 볼지 여부
+    # - true 권장
+    crash_as_anomaly: true
+
+    # ISO-TP 상세 파라미터
+    isotp_params:
+      # 최소 separation time
+      # - consecutive frame 사이 최소 간격
+      stmin: 0
+
+      # blocksize
+      # - receiver가 한 번에 허용하는 CF 개수
+      blocksize: 8
+
+      # wait frame max
+      wftmax: 0
+
+      # 송신 데이터 길이
+      tx_data_length: 8
+
+      # 송신 패딩 바이트
+      tx_padding: 170
+
+      # Flow Control 프레임 대기 timeout(ms)
+      rx_flowcontrol_timeout: 1000
+
+      # Consecutive Frame 대기 timeout(ms)
+      rx_consecutive_frame_timeout: 1000
+
+
+# Evidence Fusion 설정
+fusion:
+  # fusion mode
+  # - binary : trial 단위 재현 여부만 사용 (가장 단순)
+  # - weight : monitor별 anomaly rate에 가중치 적용 (운영 기본 추천)
+  # - score  : monitor별 mean_score 가중합 (실험/분석용)
+  fusion_mode: "weight"
+
+  # SOFT_FAIL 임계값
+  # - fusion_score >= soft_threshold 이면 최소 SOFT_FAIL
+  soft_threshold: 0.3
+
+  # HARD_FAIL 임계값
+  # - fusion_score >= hard_threshold 이면 HARD_FAIL
+  # - 반드시 soft_threshold보다 커야 함
+  hard_threshold: 0.7
+
+  # 모니터별 가중치
+  # - weight 모드/score 모드에서 사용
+  # - 합이 꼭 1일 필요는 없고 내부에서 정규화됨
+  weights:
+    # timing 이상 징후 비중
+    timing: 0.3
+
+    # uds 이상 징후 비중
+    # - binary 성격이 강하고 의미가 큰 경우가 많아 조금 높게 둠
+    uds: 0.4
+
+    # dbc 이상 징후 비중
+    dbc: 0.3
