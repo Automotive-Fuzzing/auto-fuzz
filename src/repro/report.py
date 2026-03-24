@@ -5,7 +5,8 @@ from typing import Any, Dict, List, Optional
 
 MONITOR_NAMES: tuple[str, ...] = ("timing", "uds", "dbc")
 
-_FAIL_STATUSES = frozenset({"crashed", "timeout"})
+FAIL_STATUSES = frozenset({"crashed", "timeout"})
+NON_FAILURE_STATUSES = frozenset({"ok", "insufficient_observation", "skipped", "pending", "running", "idle", "unknown"})
 
 
 @dataclass
@@ -42,14 +43,25 @@ class ResultFrame:
     @staticmethod
     def _trial_failed(mv: Dict[str, Any]) -> bool:
         status = str(mv.get("status", "ok")).lower()
-        if status in _FAIL_STATUSES:
+        if status in FAIL_STATUSES:
             return True
 
-        # 모니터가 직접 anomaly 여부를 넘겨주면 그것을 신뢰
         if "is_anomalous" in mv:
             return bool(mv.get("is_anomalous", False))
 
-        # is_anomalous가 없으면 score 기반 fallback
+        summary = mv.get("summary", {})
+        if isinstance(summary, dict):
+            summary_status = str(summary.get("status", "")).lower()
+
+            if summary_status in FAIL_STATUSES:
+                return True
+
+            if "is_anomalous" in summary:
+                return bool(summary.get("is_anomalous", False))
+
+        if status and status not in NON_FAILURE_STATUSES:
+            return True
+
         return float(mv.get("score", 0.0)) > 0.0
 
     @staticmethod

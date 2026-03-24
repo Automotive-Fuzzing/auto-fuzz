@@ -79,6 +79,12 @@ class AutoFuzzPipeline:
         self.seed_interval = float(fuzz_cfg.get("seed_interval", 0.05))
         self.monitor_grace = float(fuzz_cfg.get("monitor_grace", 0.5))
 
+        self.monitor_cfg = cfg.get("monitor", {})
+        self.monitor_manager_cfg = self.monitor_cfg.get("manager", {})
+        self.timing_monitor_cfg = self.monitor_cfg.get("timing", {})
+        self.dbc_monitor_cfg = self.monitor_cfg.get("dbc", {})
+        self.uds_monitor_cfg = self.monitor_cfg.get("uds", {})
+
     def close(self) -> None:
         self.queue.close()
         self.seed_manager.close()
@@ -93,7 +99,18 @@ class AutoFuzzPipeline:
             return int(seed.arb_id)
         return int(seed.message_id)
 
+    def _uds_target_id(self) -> int:
+        uds_id = self.uds_monitor_cfg.get("target_uds_id")
+        if uds_id is None:
+            return 0x70E
+        return int(uds_id)
+
+    def _can_channel(self) -> str:
+        return str(self.cfg["can"]["channel"])
+
     def _build_dbc_rules(self, arb_id: int) -> Dict[str, Dict[str, Any]]:
+        enum_relax_threshold = int(self.dbc_monitor_cfg.get("enum_relax_threshold", 3))
+
         for msg in self.parsed_dbc.get("messages", []):
             if int(msg.get("id")) != int(arb_id):
                 continue
@@ -121,10 +138,9 @@ class AutoFuzzPipeline:
                     enum_vals = list(choices.keys()) if isinstance(choices, dict) else None
                     coerce_int = True
 
-                # enum이 너무 희소하고 실제 연속값 신호처럼 보이면 enum 검사 비활성화
                 if (
                     enum_vals is not None
-                    and len(enum_vals) <= 3
+                    and len(enum_vals) <= enum_relax_threshold
                     and kind in ("int", "float")
                     and length not in (1, None)
                 ):
@@ -146,25 +162,57 @@ class AutoFuzzPipeline:
         return {}
 
     def _build_monitor_manager(self, arb_id: int) -> MonitorManager:
+        timing_monitor = TimingMonitor.from_config(
+            self.timing_monitor_cfg,
+            channel=self._can_channel(),
+            target_id=arb_id,
+        )
+
+        dbc_monitor = DBCMonitor.from_config(
+            self.dbc_monitor_cfg,
+            channel=self._can_channel(),
+            dbc_path=self.dbc_path,
+            target_id=arb_id,
+            seed_db_path=self.db_path,
+            rules=self._build_dbc_rules(arb_id),
+        )
+
+        uds_monitor = UDSMonitor.from_config(
+            self.uds_monitor_cfg,
+            nrc_cfg_path="config/nrc_weights.yaml",
+        )
+
         return MonitorManager(
-            timing_monitor=TimingMonitor(
-                channel=self.cfg["can"]["channel"],
-                target_id=arb_id,
+            timing_monitor=timing_monitor,
+            uds_monitor=uds_monitor,
+            dbc_monitor=dbc_monitor,
+            thread_timeout_as_anomaly=bool(
+                self.monitor_manager_cfg.get("thread_timeout_as_anomaly", False)
             ),
-            uds_monitor=UDSMonitor(),
-            dbc_monitor=DBCMonitor(
-                channel=self.cfg["can"]["channel"],
-                dbc_path=self.dbc_path,
-                target_id=arb_id,
-                seed_db_path=self.db_path,
-                rules=self._build_dbc_rules(arb_id),
+            crash_as_anomaly=bool(
+                self.monitor_manager_cfg.get("crash_as_anomaly", True)
             ),
         )
 
     def _collect_monitor_results(self, arb_id: int) -> Dict[str, Dict[str, Any]]:
-        timing_timeout = float(self.cfg["fuzz"].get("timing_timeout", 5.0))
-        dbc_timeout = float(self.cfg["fuzz"].get("dbc_timeout", 5.0))
-        wait_timeout = max(timing_timeout, dbc_timeout) + self.monitor_grace
+        timing_timeout = float(
+            self.cfg.get("fuzz", {}).get(
+                "timing_timeout",
+                self.timing_monitor_cfg.get("default_timeout_sec", 5.0),
+            )
+        )
+        dbc_timeout = float(
+            self.cfg.get("fuzz", {}).get(
+                "dbc_timeout",
+                self.dbc_monitor_cfg.get("default_window_sec", 1.5),
+            )
+        )
+
+        uds_timeout = float(
+            self.uds_monitor_cfg.get("request_timeout", 1.0)
+        )
+
+        wait_timeout = max(timing_timeout, dbc_timeout, uds_timeout) + self.monitor_grace
 
         manager = self._build_monitor_manager(arb_id)
         manager.start_monitors(
@@ -244,11 +292,13 @@ class AutoFuzzPipeline:
             if status in FAIL_STATUSES:
                 return True
 
-            if "is_anomalous" in result:
-                if bool(result.get("is_anomalous", False)):
-                    return True
-            else:
-                if float(result.get("score", 0.0)) > 0.0:
+            if bool(result.get("is_anomalous", False)):
+                return True
+
+            summary = result.get("summary", {})
+            if isinstance(summary, dict):
+                summary_status = str(summary.get("status", "")).lower()
+                if summary_status in FAIL_STATUSES:
                     return True
 
         return False
@@ -366,9 +416,9 @@ class AutoFuzzPipeline:
                 )
                 frame = ResultFrame.from_trial_results(seed.id, trial_results)
 
-                fusion = EvidenceFusion(
-                    mode=self.cfg.get("fuzz", {}).get("fusion_mode", "binary")
-                ).evaluate(frame)
+                fusion = EvidenceFusion.from_config(
+                    self.cfg.get("fusion", {})
+                ).evaluate(frame)   
 
                 self.seed_manager.save_repro_summary(
                     seed.id,
