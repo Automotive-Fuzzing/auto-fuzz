@@ -1,5 +1,10 @@
+# src/monitor/monitor_manager.py
+
+from __future__ import annotations
+
 import threading
 from typing import Dict, Optional, Any
+
 from .timing_monitor import TimingMonitor
 from .uds_monitor import UDSMonitor
 from .dbc_monitor import DBCMonitor
@@ -10,30 +15,34 @@ class MonitorManager:
         self,
         timing_monitor: Optional[TimingMonitor] = None,
         uds_monitor: Optional[UDSMonitor] = None,
-        dbc_monitor: Optional[DBCMonitor] = None
+        dbc_monitor: Optional[DBCMonitor] = None,
+        thread_timeout_as_anomaly: bool = False,
+        crash_as_anomaly: bool = True,
     ):
         self.timing_monitor = timing_monitor
         self.uds_monitor = uds_monitor
         self.dbc_monitor = dbc_monitor
+
+        self.thread_timeout_as_anomaly = thread_timeout_as_anomaly
+        self.crash_as_anomaly = crash_as_anomaly
 
         self.threads: Dict[str, threading.Thread] = {}
 
         self.scores: Dict[str, float] = {
             "timing": 0.0,
             "uds": 0.0,
-            "dbc": 0.0
+            "dbc": 0.0,
         }
         self.status: Dict[str, str] = {
             "timing": "pending",
             "uds": "pending",
-            "dbc": "pending"
+            "dbc": "pending",
         }
         self.completed: Dict[str, bool] = {
             "timing": False,
             "uds": False,
-            "dbc": False
+            "dbc": False,
         }
-
         self.anomalies: Dict[str, bool] = {
             "timing": False,
             "uds": False,
@@ -51,7 +60,7 @@ class MonitorManager:
     def start_monitors(
         self,
         timing_timeout: Optional[float] = 5.0,
-        dbc_timeout: Optional[float] = 5.0
+        dbc_timeout: Optional[float] = 5.0,
     ):
         if self.running:
             print("[WARN] Monitors are already running")
@@ -77,7 +86,7 @@ class MonitorManager:
                 target=self._run_timing_monitor,
                 args=(timing_timeout,),
                 daemon=True,
-                name="TimingMonitor"
+                name="TimingMonitor",
             )
             self.threads["timing"] = thread
             thread.start()
@@ -94,7 +103,7 @@ class MonitorManager:
             thread = threading.Thread(
                 target=self._run_uds_monitor,
                 daemon=True,
-                name="UDSMonitor"
+                name="UDSMonitor",
             )
             self.threads["uds"] = thread
             thread.start()
@@ -112,7 +121,7 @@ class MonitorManager:
                 target=self._run_dbc_monitor,
                 args=(dbc_timeout,),
                 daemon=True,
-                name="DBCMonitor"
+                name="DBCMonitor",
             )
             self.threads["dbc"] = thread
             thread.start()
@@ -123,7 +132,6 @@ class MonitorManager:
                 self.status["dbc"] = "skipped"
 
         print(f"[INFO] Total {len(self.threads)} monitor(s) running")
-
 
     def _run_timing_monitor(self, timeout: Optional[float]):
         try:
@@ -160,13 +168,13 @@ class MonitorManager:
 
                 self.completed["timing"] = True
                 self.status["timing"] = "crashed"
-                self.anomalies["timing"] = False
+                self.anomalies["timing"] = self.crash_as_anomaly
                 self.details["timing"] = {
                     "score": 0.0,
                     "status": "crashed",
-                    "is_anomalous": False,
+                    "is_anomalous": self.crash_as_anomaly,
+                    "summary": {"last_reason": str(e)},
                 }
-                
 
     def _run_uds_monitor(self):
         try:
@@ -203,11 +211,12 @@ class MonitorManager:
 
                 self.completed["uds"] = True
                 self.status["uds"] = "crashed"
-                self.anomalies["uds"] = False
+                self.anomalies["uds"] = self.crash_as_anomaly
                 self.details["uds"] = {
                     "score": 0.0,
                     "status": "crashed",
-                    "is_anomalous": False,
+                    "is_anomalous": self.crash_as_anomaly,
+                    "summary": {"last_reason": str(e)},
                 }
 
     def _run_dbc_monitor(self, timeout: Optional[float]):
@@ -220,6 +229,7 @@ class MonitorManager:
             with self.state_lock:
                 if self.status["dbc"] == "timeout":
                     return
+
                 self.scores["dbc"] = fail_score
                 self.completed["dbc"] = True
                 self.status["dbc"] = dbc_status
@@ -231,20 +241,25 @@ class MonitorManager:
                     "summary": dbc_summary,
                 }
 
-            print(f"[INFO] DBC Monitor completed - Score: {fail_score}, status={dbc_status}, anomalous={dbc_is_anomalous}")
+            print(
+                f"[INFO] DBC Monitor completed - "
+                f"Score: {fail_score}, status={dbc_status}, anomalous={dbc_is_anomalous}"
+            )
 
         except Exception as e:
             print(f"[ERROR] DBC Monitor crashed: {e}")
             with self.state_lock:
                 if self.status["dbc"] == "timeout":
                     return
+
                 self.completed["dbc"] = True
                 self.status["dbc"] = "crashed"
-                self.anomalies["dbc"] = False
+                self.anomalies["dbc"] = self.crash_as_anomaly
                 self.details["dbc"] = {
                     "score": 0.0,
                     "status": "crashed",
-                    "is_anomalous": False,
+                    "is_anomalous": self.crash_as_anomaly,
+                    "summary": {"last_reason": str(e)},
                 }
 
     def wait_for_completion(self, timeout: Optional[float] = None):
@@ -259,11 +274,11 @@ class MonitorManager:
                 with self.state_lock:
                     self.completed[name] = True
                     self.status[name] = "timeout"
-                    self.anomalies[name] = False
+                    self.anomalies[name] = self.thread_timeout_as_anomaly
                     self.details[name] = {
                         "score": self.scores.get(name, 0.0),
                         "status": "timeout",
-                        "is_anomalous": False,
+                        "is_anomalous": self.thread_timeout_as_anomaly,
                     }
 
         self.running = False

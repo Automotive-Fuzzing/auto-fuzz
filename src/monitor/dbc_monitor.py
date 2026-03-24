@@ -1,9 +1,13 @@
 # src/monitor/dbc_monitor.py
 
+from __future__ import annotations
+
 import time
+from typing import Dict, Any, Optional, List, Union
+
 import can
 import cantools
-from typing import Dict, Any, Optional, List, Union
+
 from ..logger.base_logger import log_event
 from ..seeds.seed_manager import SeedManager
 
@@ -18,6 +22,97 @@ class DBCMonitor:
         "enum": 1.5,
         "range": 1.0,
     }
+
+    def __init__(
+        self,
+        channel: str,
+        dbc_path: str,
+        target_id: int,
+        seed_db_path: str,
+        rules: Optional[Dict[str, Dict[str, Any]]] = None,
+        anomaly_threshold: float = 0.40,
+        max_frames: int = 5,
+        min_observed_frames: int = 2,
+        default_window_sec: float = 1.5,
+        timeout_as_anomaly: bool = False,
+        insufficient_observation_as_anomaly: bool = False,
+        float_enum_epsilon: float = 1e-4,
+        enum_relax_threshold: int = 3,
+        weights: Optional[Dict[str, float]] = None,
+    ):
+        self.channel = channel
+        self.dbc_path = dbc_path
+        self.target_id = target_id
+        self.seed_db_path = seed_db_path
+
+        self.rules = rules or {}
+        self.anomaly_threshold = anomaly_threshold
+        self.max_frames = max_frames
+        self.min_observed_frames = min_observed_frames
+        self.default_window_sec = default_window_sec
+        self.timeout_as_anomaly = timeout_as_anomaly
+        self.insufficient_observation_as_anomaly = insufficient_observation_as_anomaly
+        self.float_enum_epsilon = float_enum_epsilon
+        self.enum_relax_threshold = enum_relax_threshold
+
+        self.weights = dict(self.DEFAULT_WEIGHTS)
+        if weights:
+            self.weights.update(weights)
+
+        self.bus: Optional[can.BusABC] = None
+        self.db = cantools.database.load_file(self.dbc_path)
+        self.msg_def = self.db.get_message_by_frame_id(self.target_id)
+
+        if self.msg_def is None:
+            raise ValueError(f"DBC에 ID 0x{self.target_id:X} 메시지 정의가 없습니다.")
+
+        if not self.rules:
+            manager = SeedManager(self.seed_db_path)
+            seeds = manager.get_all()
+            self.rules = self._infer_rules_from_seeds(seeds, self.target_id)
+            print(f"[INFO] Seed DB로부터 {len(self.rules)}개의 신호 규칙을 불러왔습니다.")
+            if not self.rules:
+                print("[WARN] Seed DB에서 규칙을 찾지 못했습니다. 검증 없이 모니터링을 진행합니다.")
+
+        self.events: List[Dict[str, Any]] = []
+        self._fail_score = 0.0
+        self._status = "idle"
+        self._is_anomalous = False
+
+        self._weighted_fail_sum = 0.0
+        self._weighted_total = 0.0
+        self._critical_failure_count = 0
+        self._observed_frames = 0
+        self._last_reason: Optional[str] = None
+
+    @classmethod
+    def from_config(
+        cls,
+        cfg: Optional[Dict[str, Any]],
+        *,
+        channel: str,
+        dbc_path: str,
+        target_id: int,
+        seed_db_path: str,
+        rules: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> "DBCMonitor":
+        cfg = cfg or {}
+        return cls(
+            channel=channel,
+            dbc_path=dbc_path,
+            target_id=target_id,
+            seed_db_path=seed_db_path,
+            rules=rules,
+            anomaly_threshold=cfg.get("anomaly_threshold", 0.40),
+            max_frames=cfg.get("max_frames", 5),
+            min_observed_frames=cfg.get("min_observed_frames", 2),
+            default_window_sec=cfg.get("default_window_sec", 1.5),
+            timeout_as_anomaly=cfg.get("timeout_as_anomaly", False),
+            insufficient_observation_as_anomaly=cfg.get("insufficient_observation_as_anomaly", False),
+            float_enum_epsilon=cfg.get("float_enum_epsilon", 1e-4),
+            enum_relax_threshold=cfg.get("enum_relax_threshold", 3),
+            weights=cfg.get("weights"),
+        )
 
     def _infer_rules_from_seeds(self, seeds, target_id):
         rules: Dict[str, Dict[str, Any]] = {}
@@ -55,8 +150,12 @@ class DBCMonitor:
                 default_enum = None
                 default_min, default_max = minimum, maximum
 
-            # enum 값이 지나치게 적고 실제 연속값 신호일 가능성이 큰 경우 enum 검사 완화
-            if enum is not None and len(enum) <= 3 and kind in ("int", "float") and length not in (1, None):
+            if (
+                enum is not None
+                and len(enum) <= self.enum_relax_threshold
+                and kind in ("int", "float")
+                and length not in (1, None)
+            ):
                 relaxed_enum = None
             else:
                 relaxed_enum = enum if enum is not None else default_enum
@@ -73,57 +172,6 @@ class DBCMonitor:
 
         return rules
 
-    def __init__(
-        self,
-        channel: str,
-        dbc_path: str,
-        target_id: int,
-        seed_db_path: str,
-        rules: Optional[Dict[str, Dict[str, Any]]] = None,
-        anomaly_threshold: float = 0.30,
-        max_frames: int = 3,
-        default_window_sec: float = 0.5,
-        weights: Optional[Dict[str, float]] = None,
-    ):
-        self.channel = channel
-        self.dbc_path = dbc_path
-        self.target_id = target_id
-        self.rules = rules or {}
-
-        self.anomaly_threshold = anomaly_threshold
-        self.max_frames = max_frames
-        self.default_window_sec = default_window_sec
-        self.weights = dict(self.DEFAULT_WEIGHTS)
-        if weights:
-            self.weights.update(weights)
-
-        self.bus = can.interface.Bus(channel=self.channel, bustype="socketcan")
-        self.db = cantools.database.load_file(self.dbc_path)
-        self.msg_def = self.db.get_message_by_frame_id(self.target_id)
-
-        if self.msg_def is None:
-            raise ValueError(f"DBC에 ID 0x{self.target_id:X} 메시지 정의가 없습니다.")
-
-        if not self.rules:
-            manager = SeedManager(seed_db_path)
-            seeds = manager.get_all()
-            self.rules = self._infer_rules_from_seeds(seeds, self.target_id)
-            print(f"[INFO] Seed DB로부터 {len(self.rules)}개의 신호 규칙을 불러왔습니다.")
-            if not self.rules:
-                print("[WARN] Seed DB에서 규칙을 찾지 못했습니다. 검증 없이 모니터링을 진행합니다.")
-
-        self.events: List[Dict[str, Any]] = []
-
-        self._fail_score = 0.0
-        self._status = "idle"
-        self._is_anomalous = False
-
-        self._weighted_fail_sum = 0.0
-        self._weighted_total = 0.0
-        self._critical_failure_count = 0
-        self._observed_frames = 0
-        self._last_reason = None
-
     def _reset_state(self):
         self.events.clear()
         self._fail_score = 0.0
@@ -137,11 +185,6 @@ class DBCMonitor:
         self._last_reason = None
 
     def start(self, timeout: Optional[float] = None, max_frames: Optional[int] = None) -> float:
-        """
-        기존 호출 호환용.
-        timeout은 이제 '관측창(window)' 의미로 사용하고,
-        max_frames개까지만 target_id 프레임을 평가한다.
-        """
         window_sec = timeout if timeout is not None else self.default_window_sec
         frame_limit = max_frames if max_frames is not None else self.max_frames
 
@@ -155,6 +198,8 @@ class DBCMonitor:
         deadline = time.monotonic() + window_sec
 
         try:
+            self.bus = can.interface.Bus(channel=self.channel, bustype="socketcan")
+
             while time.monotonic() < deadline and self._observed_frames < frame_limit:
                 remaining = max(0.0, deadline - time.monotonic())
                 recv_timeout = min(0.1, remaining) if remaining > 0 else 0.0
@@ -172,10 +217,12 @@ class DBCMonitor:
             self._finalize_verdict()
 
         finally:
-            try:
-                self.bus.shutdown()
-            except Exception:
-                pass
+            if self.bus is not None:
+                try:
+                    self.bus.shutdown()
+                except Exception:
+                    pass
+                self.bus = None
 
         print(
             f"[INFO] DBC Monitor finished - "
@@ -253,10 +300,11 @@ class DBCMonitor:
         enum_vals = rule.get("enum")
         if enum_vals is not None:
             enum_weight = self.weights["enum"]
+
             if rule.get("kind") == "float":
-                enum_ok = any(float(val) == float(a) for a in enum_vals)
+                enum_ok = any(abs(float(val) - float(a)) <= self.float_enum_epsilon for a in enum_vals)
             else:
-                enum_ok = val in set(int(a) for a in enum_vals)
+                enum_ok = int(val) in {int(a) for a in enum_vals}
 
             self._register_check(
                 metric="enum",
@@ -276,7 +324,6 @@ class DBCMonitor:
         mn = sigmn if sigmn is None else (sigmn - offset) / factor
         mx = sigmx if sigmx is None else (sigmx - offset) / factor
 
-        # range 하한
         if mn is not None:
             range_min_ok = float(val) >= float(mn)
             self._register_check(
@@ -290,7 +337,6 @@ class DBCMonitor:
                 ok = False
                 self._last_reason = f"range_min_violation: {sig}"
 
-        # range 상한
         if mx is not None:
             range_max_ok = float(val) <= float(mx)
             self._register_check(
@@ -333,7 +379,13 @@ class DBCMonitor:
         if self._observed_frames == 0:
             self._status = "timeout"
             self._fail_score = 0.0
-            self._is_anomalous = False
+            self._is_anomalous = self.timeout_as_anomaly
+            return
+
+        if self._observed_frames < self.min_observed_frames:
+            self._status = "insufficient_observation"
+            self._fail_score = 0.0 if self._weighted_total <= 0 else min(self._weighted_fail_sum / self._weighted_total, 1.0)
+            self._is_anomalous = self.insufficient_observation_as_anomaly
             return
 
         if self._weighted_total <= 0:
